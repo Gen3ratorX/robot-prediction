@@ -25,6 +25,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import MovementLSTM, SpatioTemporalGCN
+from movement_features import (
+    MOVEMENT_FEATURE_SIZE,
+    apply_stationary_motion_gate,
+    build_movement_features,
+    estimate_motion_energy,
+)
 from gesture_landmarks import extract_advanced_features
 
 
@@ -79,7 +85,10 @@ def main():
             classes = json.load(f)
         movement_classes = {v: k for k, v in classes.items()}
 
-        movement_model = MovementLSTM(input_size=33 * 3, num_classes=len(classes))
+        movement_model = MovementLSTM(
+            input_size=MOVEMENT_FEATURE_SIZE,
+            num_classes=len(classes)
+        )
         ckpt = torch.load(movement_pth, map_location=device, weights_only=True)
         movement_model.load_state_dict(ckpt['model_state_dict'])
         movement_model.to(device).eval()
@@ -143,9 +152,15 @@ def main():
     # Buffers
     skeleton_buffer = deque(maxlen=args.seq_length)
     gesture_buffer = deque(maxlen=10)
-    movement_buffer = deque(maxlen=15)
-    action_buffer = deque(maxlen=15)
+    movement_buffer = deque(maxlen=20)
+    action_buffer = deque(maxlen=20)
     fps_buffer = deque(maxlen=30)
+    movement_display_name = None
+    movement_display_conf = 0.0
+    movement_candidate_name = None
+    movement_candidate_conf = 0.0
+    movement_candidate_streak = 0
+    movement_hysteresis_frames = 3
 
     print("\n" + "=" * 55)
     print("HUMAN-AWARE ROBOT NAVIGATION — COMBINED LIVE TEST")
@@ -170,9 +185,16 @@ def main():
         gesture_conf = 0.0
         movement_text = ""
         action_text = ""
+        confidence_text = ""
         robot_cmd = "CONTINUE FORWARD"
         hand_found = False
         hand_label = "?"
+        move_name = None
+        move_conf = 0.0
+        move_probs = None
+        action_name = None
+        action_conf = 0.0
+        action_probs = None
 
         # ============================================
         # GESTURE RECOGNITION (Landmark-based)
@@ -245,12 +267,8 @@ def main():
 
                 # Movement LSTM
                 if movement_model is not None:
-                    hip = skeleton_seq[:, 0:1, :]
-                    normalized = skeleton_seq - hip
-                    std = normalized.std()
-                    if std > 1e-6:
-                        normalized = normalized / std
-                    flat = normalized.reshape(args.seq_length, 33 * 3)
+                    flat = build_movement_features(skeleton_seq)
+                    motion_energy = estimate_motion_energy(skeleton_seq)
                     input_t = torch.tensor(flat).unsqueeze(0).to(device)
 
                     with torch.no_grad():
@@ -261,13 +279,52 @@ def main():
 
                     if len(movement_buffer) >= 3:
                         avg_probs = np.mean(list(movement_buffer), axis=0)
-                        pred_idx = np.argmax(avg_probs)
-                        move_conf = avg_probs[pred_idx]
+                        move_probs = avg_probs
+                        pred_idx, move_conf, stationary_gated = apply_stationary_motion_gate(
+                            avg_probs, movement_classes, motion_energy
+                        )
                         move_name = movement_classes[pred_idx]
                         if move_conf > args.confidence:
-                            movement_text = f"Movement: {move_name} ({move_conf:.0%})"
+                            if movement_display_name is None:
+                                movement_display_name = move_name
+                                movement_display_conf = move_conf
+                                movement_candidate_name = None
+                                movement_candidate_conf = 0.0
+                                movement_candidate_streak = 0
+                            elif move_name == movement_display_name:
+                                movement_display_conf = move_conf
+                                movement_candidate_name = None
+                                movement_candidate_conf = 0.0
+                                movement_candidate_streak = 0
+                            else:
+                                if move_name == movement_candidate_name:
+                                    movement_candidate_streak += 1
+                                    movement_candidate_conf = move_conf
+                                else:
+                                    movement_candidate_name = move_name
+                                    movement_candidate_conf = move_conf
+                                    movement_candidate_streak = 1
+
+                                if movement_candidate_streak >= movement_hysteresis_frames:
+                                    movement_display_name = movement_candidate_name
+                                    movement_display_conf = movement_candidate_conf
+                                    movement_candidate_name = None
+                                    movement_candidate_conf = 0.0
+                                    movement_candidate_streak = 0
+
+                            movement_text = (
+                                f"Movement: {movement_display_name} "
+                                f"({movement_display_conf:.0%})"
+                            )
+                        elif movement_display_name is not None:
+                            movement_text = (
+                                f"Movement: {movement_display_name} "
+                                f"({movement_display_conf:.0%})"
+                            )
                         else:
                             movement_text = f"Movement: uncertain ({move_conf:.0%})"
+                        if stationary_gated and movement_display_name == 'stationary':
+                            movement_text += " [stable]"
 
                 # ST-GCN
                 if action_model is not None:
@@ -282,6 +339,7 @@ def main():
 
                     if len(action_buffer) >= 3:
                         avg_probs = np.mean(list(action_buffer), axis=0)
+                        action_probs = avg_probs
                         pred_idx = np.argmax(avg_probs)
                         action_conf = avg_probs[pred_idx]
                         action_name = action_classes[pred_idx]
@@ -291,6 +349,9 @@ def main():
                             action_text = f"Action: uncertain ({action_conf:.0%})"
         else:
             movement_text = "Movement: No person detected"
+            movement_candidate_name = None
+            movement_candidate_conf = 0.0
+            movement_candidate_streak = 0
 
         # ============================================
         # ROBOT DECISION (Priority System)
@@ -312,20 +373,48 @@ def main():
         elif gesture_valid and gesture_name == "right":
             robot_cmd = "TURN RIGHT (gesture)"
         # Priority 2: Movement avoidance
-        elif "approaching" in movement_text.lower() and "approaching" in action_text.lower():
-            robot_cmd = "STOP + TURN (both agree)"
-        elif "moving_left" in movement_text.lower() and "moving_left" in action_text.lower():
-            robot_cmd = "ADJUST RIGHT (both agree)"
-        elif "moving_right" in movement_text.lower() and "moving_right" in action_text.lower():
-            robot_cmd = "ADJUST LEFT (both agree)"
-        elif "approaching" in movement_text.lower() and "uncertain" not in movement_text:
-            robot_cmd = "CAUTION (LSTM: approaching)"
+        else:
+            fused_name = None
+            fused_conf = 0.0
+            if move_probs is not None and action_probs is not None:
+                movement_weight = max(move_conf, 1e-6)
+                action_weight = max(action_conf, 1e-6)
+                fused_scores = {}
+                for idx, name in movement_classes.items():
+                    fused_scores[name] = fused_scores.get(name, 0.0) + movement_weight * move_probs[idx]
+                for idx, name in action_classes.items():
+                    fused_scores[name] = fused_scores.get(name, 0.0) + action_weight * action_probs[idx]
+
+                fused_name, fused_score = max(fused_scores.items(), key=lambda item: item[1])
+                fused_conf = fused_score / (movement_weight + action_weight)
+            elif move_name and move_conf > args.confidence:
+                fused_name = move_name
+                fused_conf = move_conf
+            elif action_name and action_conf > args.confidence:
+                fused_name = action_name
+                fused_conf = action_conf
+
+            if move_conf > 0.0 or action_conf > 0.0:
+                confidence_text = (
+                    f"Motion Conf  LSTM:{move_conf:.0%}  ST-GCN:{action_conf:.0%}"
+                )
+                if fused_name is not None:
+                    confidence_text += f"  Fused:{fused_conf:.0%}"
+
+            if fused_name == "approaching" and fused_conf > args.confidence:
+                robot_cmd = "STOP + TURN (fused)"
+            elif fused_name == "moving_left" and fused_conf > args.confidence:
+                robot_cmd = "ADJUST RIGHT (fused)"
+            elif fused_name == "moving_right" and fused_conf > args.confidence:
+                robot_cmd = "ADJUST LEFT (fused)"
+            elif move_name == "approaching" and move_conf > args.confidence:
+                robot_cmd = "CAUTION (LSTM: approaching)"
 
         # ============================================
         # DRAW UI
         # ============================================
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 110), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, 0), (w, 132), (0, 0, 0), -1)
         cv2.rectangle(overlay, (0, h - 55), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
@@ -338,6 +427,9 @@ def main():
                 cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, color, 2)
                 y += 22
+        if confidence_text:
+            cv2.putText(frame, confidence_text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (180, 220, 255), 2)
 
         # Hand indicator
         if hand_found:

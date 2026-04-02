@@ -34,8 +34,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from datasets import (GestureDataset, MovementDataset, 
-                      SkeletonGraphDataset, create_data_loaders)
+from datasets import (
+    GestureDataset,
+    MovementDataset,
+    SkeletonGraphDataset,
+    create_data_loaders,
+)
+from movement_features import MOVEMENT_FEATURE_SIZE
 from models import GestureCNN, MovementLSTM, SpatioTemporalGCN, count_parameters
 
 
@@ -65,9 +70,35 @@ class Trainer:
         total, trainable = count_parameters(model)
         print(f"Device: {self.device}")
         print(f"Parameters: {total:,} total, {trainable:,} trainable")
+
+    def _apply_same_class_mixup(self, inputs, labels, alpha=0.2):
+        """
+        Interpolate samples only with others from the same class.
+        Because labels are unchanged, this behaves like a class-preserving
+        augmentation without requiring soft targets.
+        """
+        if inputs.size(0) < 2 or alpha <= 0:
+            return inputs
+
+        mixed_inputs = inputs.clone()
+        unique_labels = labels.unique()
+
+        for label in unique_labels:
+            class_indices = torch.nonzero(labels == label, as_tuple=False).flatten()
+            if class_indices.numel() < 2:
+                continue
+
+            perm = class_indices[torch.randperm(class_indices.numel(), device=labels.device)]
+            lam = np.random.beta(alpha, alpha)
+            mixed_inputs[class_indices] = (
+                lam * inputs[class_indices] + (1.0 - lam) * inputs[perm]
+            )
+
+        return mixed_inputs
     
     def train(self, train_loader, val_loader, epochs=50, lr=1e-3, 
-              weight_decay=1e-4, patience=10, model_name='model'):
+              weight_decay=1e-4, patience=10, model_name='model',
+              label_smoothing=0.1, same_class_mixup=False, mixup_alpha=0.2):
         """
         Full training loop with:
         - Learning rate scheduling
@@ -75,7 +106,7 @@ class Trainer:
         - Best model checkpointing
         - Training history plots
         """
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         optimizer = optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
         )
@@ -104,6 +135,11 @@ class Trainer:
             for batch_idx, (inputs, labels) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device)
+
+                if same_class_mixup:
+                    inputs = self._apply_same_class_mixup(
+                        inputs, labels, alpha=mixup_alpha
+                    )
                 
                 optimizer.zero_grad()
                 outputs = self.model(inputs)
@@ -324,7 +360,7 @@ def train_movement_lstm(data_dir, epochs=80, batch_size=32, lr=1e-3,
     # Load dataset
     dataset = MovementDataset(data_dir, seq_length=seq_length)
     num_classes = len(dataset.classes)
-    input_size = num_joints * 3
+    input_size = MOVEMENT_FEATURE_SIZE
     
     train_loader, val_loader, test_loader = create_data_loaders(
         dataset, batch_size=batch_size
@@ -343,7 +379,8 @@ def train_movement_lstm(data_dir, epochs=80, batch_size=32, lr=1e-3,
     trainer.train(
         train_loader, val_loader,
         epochs=epochs, lr=lr,
-        model_name='movement_lstm'
+        model_name='movement_lstm',
+        same_class_mixup=True,
     )
     
     # Test

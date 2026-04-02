@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
 
+from movement_features import build_movement_features
+
 
 class GestureDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -91,13 +93,10 @@ class MovementDataset(Dataset):
         else:
             skeleton_seq = skeleton_seq[:self.seq_length]
         if self.normalize:
-            hip_center = skeleton_seq[:, 0:1, :]
-            skeleton_seq = skeleton_seq - hip_center
-            std = skeleton_seq.std()
-            if std > 1e-6:
-                skeleton_seq = skeleton_seq / std
-        T, J, C = skeleton_seq.shape
-        skeleton_flat = skeleton_seq.reshape(T, J * C)
+            skeleton_flat = build_movement_features(skeleton_seq)
+        else:
+            T, J, C = skeleton_seq.shape
+            skeleton_flat = skeleton_seq.reshape(T, J * C)
         return torch.tensor(skeleton_flat), label
 
 

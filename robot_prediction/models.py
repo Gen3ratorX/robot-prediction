@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from movement_features import MOVEMENT_FEATURE_SIZE
+
 
 # ============================================================
 # MODEL 1: CNN FOR GESTURE RECOGNITION
@@ -109,19 +111,18 @@ class MovementLSTM(nn.Module):
     Bi-directional LSTM for predicting human movement direction
     from skeleton keypoint sequences.
     
-    Input:  (B, T, J*3)      — T frames of flattened joint coordinates
+    Input:  (B, T, F)        — T frames of flattened movement features
     Output: (B, num_classes)  — movement direction logits
     
     T = sequence length (e.g., 30 frames = 1 second at 30fps)
-    J = number of joints (33 for MediaPipe, 25 for OpenPose)
-    3 = (x, y, z) per joint
+    F = normalized joint positions + selected joint velocities
     """
     
-    def __init__(self, input_size=99, hidden_size=128, num_layers=2, 
+    def __init__(self, input_size=MOVEMENT_FEATURE_SIZE, hidden_size=128, num_layers=2,
                  num_classes=5, dropout=0.3):
         """
         Args:
-            input_size: J * 3 (e.g., 33 joints * 3 coords = 99)
+            input_size: movement feature size per frame
             hidden_size: LSTM hidden dimension
             num_layers: number of stacked LSTM layers
             num_classes: movement directions
@@ -363,8 +364,8 @@ if __name__ == '__main__':
     
     # Test MovementLSTM
     print("\n--- MovementLSTM ---")
-    lstm = MovementLSTM(input_size=99, num_classes=5)
-    x = torch.randn(2, 30, 99)  # 30 frames, 33 joints * 3 coords
+    lstm = MovementLSTM(input_size=MOVEMENT_FEATURE_SIZE, num_classes=5)
+    x = torch.randn(2, 30, MOVEMENT_FEATURE_SIZE)
     out = lstm(x)
     total, trainable = count_parameters(lstm)
     print(f"  Input:  {x.shape}")

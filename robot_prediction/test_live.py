@@ -29,6 +29,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import GestureCNN, MovementLSTM, SpatioTemporalGCN
+from movement_features import (
+    MOVEMENT_FEATURE_SIZE,
+    apply_stationary_motion_gate,
+    build_movement_features,
+    estimate_motion_energy,
+)
 
 
 def main():
@@ -76,7 +82,10 @@ def main():
             classes = json.load(f)
         class_maps['movement'] = {v: k for k, v in classes.items()}
 
-        model = MovementLSTM(input_size=33 * 3, num_classes=len(classes))
+        model = MovementLSTM(
+            input_size=MOVEMENT_FEATURE_SIZE,
+            num_classes=len(classes)
+        )
         ckpt = torch.load(movement_pth, map_location=device, weights_only=True)
         model.load_state_dict(ckpt['model_state_dict'])
         model.to(device).eval()
@@ -290,12 +299,8 @@ def main():
 
                 # Movement LSTM with smoothing
                 if 'movement' in models:
-                    hip = skeleton_seq[:, 0:1, :]
-                    normalized = skeleton_seq - hip
-                    std = normalized.std()
-                    if std > 1e-6:
-                        normalized = normalized / std
-                    flat = normalized.reshape(args.seq_length, 33 * 3)
+                    flat = build_movement_features(skeleton_seq)
+                    motion_energy = estimate_motion_energy(skeleton_seq)
                     input_t = torch.tensor(flat).unsqueeze(0).to(device)
 
                     with torch.no_grad():
@@ -306,13 +311,16 @@ def main():
 
                     if len(movement_buffer) >= 2:
                         avg_probs = np.mean(list(movement_buffer), axis=0)
-                        pred_idx = np.argmax(avg_probs)
-                        move_conf = avg_probs[pred_idx]
+                        pred_idx, move_conf, stationary_gated = apply_stationary_motion_gate(
+                            avg_probs, class_maps['movement'], motion_energy
+                        )
                         move_name = class_maps['movement'][pred_idx]
                         if move_conf > args.confidence:
                             movement_text = f"Movement: {move_name} ({move_conf:.0%})"
                         else:
                             movement_text = f"Movement: uncertain ({move_conf:.0%})"
+                        if stationary_gated and move_name == 'stationary':
+                            movement_text += " [stable]"
 
                 # ST-GCN with smoothing
                 if 'action' in models:

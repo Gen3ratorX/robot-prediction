@@ -45,6 +45,12 @@ from cv_bridge import CvBridge
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models import GestureCNN, MovementLSTM, SpatioTemporalGCN
+from movement_features import (
+    MOVEMENT_FEATURE_SIZE,
+    apply_stationary_motion_gate,
+    build_movement_features,
+    estimate_motion_energy,
+)
 
 
 class HumanAwareNavigationNode(Node):
@@ -140,7 +146,7 @@ class HumanAwareNavigationNode(Node):
             self.movement_idx_to_class = {v: k for k, v in self.movement_classes.items()}
 
             self.movement_model = MovementLSTM(
-                input_size=self.num_joints * 3,
+                input_size=MOVEMENT_FEATURE_SIZE,
                 num_classes=len(self.movement_classes)
             )
             ckpt = torch.load(
@@ -264,24 +270,19 @@ class HumanAwareNavigationNode(Node):
         if self.movement_model is None:
             return None, 0.0
 
-        hip = skeleton_seq[:, 0:1, :]
-        normalized = skeleton_seq - hip
-        std = normalized.std()
-        if std > 1e-6:
-            normalized = normalized / std
-
-        T, J, C = normalized.shape
-        flat = normalized.reshape(T, J * C)
+        flat = build_movement_features(skeleton_seq)
+        motion_energy = estimate_motion_energy(skeleton_seq)
 
         input_tensor = torch.tensor(flat).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             logits = self.movement_model(input_tensor)
-            probs = F.softmax(logits, dim=1)
-            conf, pred = probs.max(1)
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
 
-        movement = self.movement_idx_to_class[pred.item()]
-        confidence = conf.item()
+        pred_idx, confidence, _ = apply_stationary_motion_gate(
+            probs, self.movement_idx_to_class, motion_energy
+        )
+        movement = self.movement_idx_to_class[pred_idx]
 
         if confidence < self.confidence_threshold:
             return None, confidence
@@ -336,10 +337,7 @@ class HumanAwareNavigationNode(Node):
                 cmd.angular.z = 0.0
                 self.get_logger().info(f"GESTURE: BACKWARD (conf={gesture_conf:.2f})")
 
-            self.cmd_vel_pub.publish(cmd)
-            return
-
-           elif gesture == 'left':
+            elif gesture == 'left':
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.5
                 self.get_logger().info(f"GESTURE: TURN LEFT (conf={gesture_conf:.2f})")
@@ -348,6 +346,9 @@ class HumanAwareNavigationNode(Node):
                 cmd.linear.x = 0.0
                 cmd.angular.z = -0.5
                 self.get_logger().info(f"GESTURE: TURN RIGHT (conf={gesture_conf:.2f})")
+
+            self.cmd_vel_pub.publish(cmd)
+            return
 
         # PRIORITY 2: Movement prediction (collision avoidance)
         if movement and movement_conf > self.confidence_threshold:
