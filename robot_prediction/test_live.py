@@ -33,6 +33,7 @@ from movement_features import (
     MOVEMENT_FEATURE_SIZE,
     apply_stationary_motion_gate,
     build_movement_features,
+    estimate_depth_scale_signature,
     estimate_motion_energy,
 )
 
@@ -301,6 +302,7 @@ def main():
                 if 'movement' in models:
                     flat = build_movement_features(skeleton_seq)
                     motion_energy = estimate_motion_energy(skeleton_seq)
+                    depth_scale = estimate_depth_scale_signature(skeleton_seq)
                     input_t = torch.tensor(flat).unsqueeze(0).to(device)
 
                     with torch.no_grad():
@@ -312,7 +314,11 @@ def main():
                     if len(movement_buffer) >= 2:
                         avg_probs = np.mean(list(movement_buffer), axis=0)
                         pred_idx, move_conf, stationary_gated = apply_stationary_motion_gate(
-                            avg_probs, class_maps['movement'], motion_energy
+                            avg_probs,
+                            class_maps['movement'],
+                            motion_energy,
+                            depth_change=depth_scale['depth_change'],
+                            scale_change=depth_scale['scale_change'],
                         )
                         move_name = class_maps['movement'][pred_idx]
                         if move_conf > args.confidence:

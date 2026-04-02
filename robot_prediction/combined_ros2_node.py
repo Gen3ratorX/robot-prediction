@@ -43,6 +43,7 @@ from movement_features import (
     MOVEMENT_FEATURE_SIZE,
     apply_stationary_motion_gate,
     build_movement_features,
+    estimate_depth_scale_signature,
     estimate_motion_energy,
 )
 from gesture_landmarks import extract_advanced_features
@@ -256,6 +257,7 @@ class HumanAwareNavigationNode(Node):
                 if self.movement_model is not None:
                     flat = build_movement_features(skeleton_seq)
                     motion_energy = estimate_motion_energy(skeleton_seq)
+                    depth_scale = estimate_depth_scale_signature(skeleton_seq)
                     input_t = torch.tensor(flat).unsqueeze(0).to(self.device)
 
                     with torch.no_grad():
@@ -267,7 +269,11 @@ class HumanAwareNavigationNode(Node):
                     if len(self.movement_buffer) >= 3:
                         avg_probs = np.mean(list(self.movement_buffer), axis=0)
                         pred_idx, movement_conf, _ = apply_stationary_motion_gate(
-                            avg_probs, self.movement_classes, motion_energy
+                            avg_probs,
+                            self.movement_classes,
+                            motion_energy,
+                            depth_change=depth_scale['depth_change'],
+                            scale_change=depth_scale['scale_change'],
                         )
                         movement_name = self.movement_classes[pred_idx]
 

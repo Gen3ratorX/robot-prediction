@@ -49,6 +49,7 @@ from movement_features import (
     MOVEMENT_FEATURE_SIZE,
     apply_stationary_motion_gate,
     build_movement_features,
+    estimate_depth_scale_signature,
     estimate_motion_energy,
 )
 
@@ -272,6 +273,7 @@ class HumanAwareNavigationNode(Node):
 
         flat = build_movement_features(skeleton_seq)
         motion_energy = estimate_motion_energy(skeleton_seq)
+        depth_scale = estimate_depth_scale_signature(skeleton_seq)
 
         input_tensor = torch.tensor(flat).unsqueeze(0).to(self.device)
 
@@ -280,7 +282,11 @@ class HumanAwareNavigationNode(Node):
             probs = F.softmax(logits, dim=1).cpu().numpy()[0]
 
         pred_idx, confidence, _ = apply_stationary_motion_gate(
-            probs, self.movement_idx_to_class, motion_energy
+            probs,
+            self.movement_idx_to_class,
+            motion_energy,
+            depth_change=depth_scale['depth_change'],
+            scale_change=depth_scale['scale_change'],
         )
         movement = self.movement_idx_to_class[pred_idx]
 

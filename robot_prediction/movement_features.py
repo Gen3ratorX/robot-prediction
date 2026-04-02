@@ -4,12 +4,19 @@ import numpy as np
 
 
 HIP_JOINTS = (23, 24)
+SHOULDER_JOINTS = (11, 12)
+TORSO_JOINTS = (11, 12, 23, 24)
 VELOCITY_JOINTS = (11, 12, 23, 24, 27, 28)
 POSITION_FEATURE_SIZE = 33 * 3
 VELOCITY_FEATURE_SIZE = len(VELOCITY_JOINTS) * 3
-MOVEMENT_FEATURE_SIZE = POSITION_FEATURE_SIZE + VELOCITY_FEATURE_SIZE
+APPROACH_AWAY_FEATURE_SIZE = 8
+MOVEMENT_FEATURE_SIZE = (
+    POSITION_FEATURE_SIZE + VELOCITY_FEATURE_SIZE + APPROACH_AWAY_FEATURE_SIZE
+)
 LANDMARK_SMOOTHING_ALPHA = 0.6
 STATIONARY_MOTION_THRESHOLD = 0.01
+DEPTH_MOTION_THRESHOLD = 0.008
+SCALE_CHANGE_THRESHOLD = 0.03
 
 
 def compute_hip_center(skeleton_seq):
@@ -44,6 +51,51 @@ def compute_velocity_features(skeleton_seq, joint_indices=VELOCITY_JOINTS):
     return velocities
 
 
+def _pairwise_distance(seq, joint_a, joint_b):
+    return np.linalg.norm(seq[:, joint_a, :] - seq[:, joint_b, :], axis=1)
+
+
+def compute_approach_away_features(skeleton_seq):
+    """Per-frame cues that preserve motion toward/away from the camera."""
+    hip_center = compute_hip_center(skeleton_seq)[:, 0, :]
+    torso_center = skeleton_seq[:, TORSO_JOINTS, :].mean(axis=1)
+
+    hip_depth = hip_center[:, 2]
+    torso_depth = torso_center[:, 2]
+    shoulder_width = _pairwise_distance(skeleton_seq, 11, 12)
+    hip_width = _pairwise_distance(skeleton_seq, 23, 24)
+    torso_height = np.linalg.norm(torso_center[:, :2] - hip_center[:, :2], axis=1)
+    nose_hip_distance = np.linalg.norm(skeleton_seq[:, 0, :] - hip_center, axis=1)
+
+    features = np.zeros((skeleton_seq.shape[0], APPROACH_AWAY_FEATURE_SIZE), dtype=np.float32)
+    features[:, 0] = hip_depth
+    features[:, 1] = torso_depth
+    features[:, 2] = shoulder_width
+    features[:, 3] = hip_width
+    features[:, 4] = torso_height
+    features[:, 5] = nose_hip_distance
+    features[1:, 6] = hip_depth[1:] - hip_depth[:-1]
+    features[1:, 7] = shoulder_width[1:] - shoulder_width[:-1]
+    return features
+
+
+def estimate_depth_scale_signature(skeleton_seq):
+    """Summarize forward/backward evidence from depth and apparent body scale."""
+    smoothed = smooth_skeleton_sequence(skeleton_seq)
+    approach_features = compute_approach_away_features(smoothed)
+    depth_change = float(np.mean(np.abs(approach_features[1:, 6]))) if approach_features.shape[0] > 1 else 0.0
+
+    shoulder_width = approach_features[:, 2]
+    baseline_width = max(float(np.mean(shoulder_width[:3])), 1e-6)
+    scale_change = float(
+        np.max(np.abs((shoulder_width - baseline_width) / baseline_width))
+    )
+    return {
+        'depth_change': depth_change,
+        'scale_change': scale_change,
+    }
+
+
 def estimate_motion_energy(skeleton_seq, joint_indices=VELOCITY_JOINTS):
     """Estimate average frame-to-frame motion magnitude for selected joints."""
     smoothed = smooth_skeleton_sequence(skeleton_seq)
@@ -56,6 +108,8 @@ def apply_stationary_motion_gate(
     probs,
     idx_to_class,
     motion_energy,
+    depth_change=0.0,
+    scale_change=0.0,
     threshold=STATIONARY_MOTION_THRESHOLD,
 ):
     """Override to stationary when measured motion is below a small threshold."""
@@ -63,7 +117,11 @@ def apply_stationary_motion_gate(
         (idx for idx, name in idx_to_class.items() if name == 'stationary'),
         None
     )
-    if stationary_idx is None or motion_energy >= threshold:
+    depth_or_scale_motion = (
+        depth_change >= DEPTH_MOTION_THRESHOLD or
+        scale_change >= SCALE_CHANGE_THRESHOLD
+    )
+    if stationary_idx is None or motion_energy >= threshold or depth_or_scale_motion:
         pred_idx = int(np.argmax(probs))
         return pred_idx, float(probs[pred_idx]), False
 
@@ -80,4 +138,5 @@ def build_movement_features(skeleton_seq):
     velocities = compute_velocity_features(normalized).reshape(
         normalized.shape[0], VELOCITY_FEATURE_SIZE
     )
-    return np.concatenate([positions, velocities], axis=1)
+    approach_away = compute_approach_away_features(smoothed)
+    return np.concatenate([positions, velocities, approach_away], axis=1)
