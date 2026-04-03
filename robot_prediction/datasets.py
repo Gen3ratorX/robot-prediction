@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from movement_features import build_movement_features
 
@@ -78,6 +78,31 @@ class MovementDataset(Dataset):
                     ))
         print(f"[MovementDataset] Found {len(self.samples)} sequences "
               f"across {len(self.classes)} classes: {self.classes}")
+
+    @staticmethod
+    def sample_group_key(sample_path):
+        """
+        Group augmented variants by their likely original source clip.
+        Assumes the first 50 sequential files in a class are real recordings and
+        later indices are augmentations derived from those originals.
+        """
+        base = os.path.basename(sample_path)
+        stem, _ = os.path.splitext(base)
+
+        if stem.startswith('ntu_A'):
+            parts = stem.split('_')
+            if len(parts) >= 2:
+                return parts[1]
+            return stem
+
+        digits = ''.join(ch for ch in stem if ch.isdigit())
+        if not digits:
+            return stem
+
+        seq_idx = int(digits)
+        if seq_idx < 50:
+            return f"orig_{seq_idx:04d}"
+        return f"orig_{seq_idx % 50:04d}"
 
     def __len__(self):
         return len(self.samples)
@@ -159,13 +184,32 @@ class SkeletonGraphDataset(Dataset):
 def create_data_loaders(dataset, batch_size=32, val_split=0.15, test_split=0.15):
     total = len(dataset)
     indices = list(range(total))
-    train_val_idx, test_idx = train_test_split(
-        indices, test_size=test_split, random_state=42
-    )
-    val_ratio = val_split / (1 - test_split)
-    train_idx, val_idx = train_test_split(
-        train_val_idx, test_size=val_ratio, random_state=42
-    )
+    if isinstance(dataset, MovementDataset):
+        groups = [
+            f"{dataset.samples[idx][1]}::{dataset.sample_group_key(dataset.samples[idx][0])}"
+            for idx in indices
+        ]
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_split, random_state=42)
+        train_val_pos, test_pos = next(splitter.split(indices, groups=groups))
+        train_val_idx = [indices[pos] for pos in train_val_pos]
+        test_idx = [indices[pos] for pos in test_pos]
+
+        val_ratio = val_split / (1 - test_split)
+        train_val_groups = [groups[pos] for pos in train_val_pos]
+        val_splitter = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=42)
+        train_pos, val_pos = next(
+            val_splitter.split(train_val_idx, groups=train_val_groups)
+        )
+        train_idx = [train_val_idx[pos] for pos in train_pos]
+        val_idx = [train_val_idx[pos] for pos in val_pos]
+    else:
+        train_val_idx, test_idx = train_test_split(
+            indices, test_size=test_split, random_state=42
+        )
+        val_ratio = val_split / (1 - test_split)
+        train_idx, val_idx = train_test_split(
+            train_val_idx, test_size=val_ratio, random_state=42
+        )
     train_loader = DataLoader(
         torch.utils.data.Subset(dataset, train_idx),
         batch_size=batch_size, shuffle=True, num_workers=2
