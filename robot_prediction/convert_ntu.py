@@ -253,7 +253,11 @@ def main():
     for action_num in sorted(grouped_files):
         print(f"  A{action_num}: {len(grouped_files[action_num])} files")
 
-    for class_name in ['approaching', 'moving_away', 'moving_left', 'moving_right', 'stationary']:
+    movement_classes = [
+        'approaching', 'moving_away', 'moving_left', 'moving_right', 'stationary'
+    ]
+
+    for class_name in movement_classes:
         os.makedirs(os.path.join(args.output_dir, class_name), exist_ok=True)
 
     saved_counts = Counter()
@@ -264,7 +268,7 @@ def main():
         files_to_process.extend(grouped_files[action_num])
 
     for skel_file in files_to_process:
-        if all(saved_counts[c] >= args.max_per_class for c in saved_counts if saved_counts):
+        if all(saved_counts[class_name] >= args.max_per_class for class_name in movement_classes):
             break
 
         try:
@@ -290,7 +294,7 @@ def main():
             skipped_counts['errors'] += 1
 
     print("\nSaved samples:")
-    for class_name in ['approaching', 'moving_away', 'moving_left', 'moving_right', 'stationary']:
+    for class_name in movement_classes:
         total = len([
             f for f in os.listdir(os.path.join(args.output_dir, class_name))
             if f.endswith('.npy')
