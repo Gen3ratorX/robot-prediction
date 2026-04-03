@@ -46,10 +46,24 @@ def main():
     parser.add_argument('--camera', type=int, default=0)
     parser.add_argument('--confidence', type=float, default=0.6)
     parser.add_argument('--seq_length', type=int, default=30)
+    parser.add_argument('--debug_fast_response', action='store_true')
     parser.add_argument('--screenshot_dir', type=str, default='motion_screenshots')
     parser.add_argument('--screenshot_interval', type=float, default=0.0)
     parser.add_argument('--max_screenshots', type=int, default=0)
     args = parser.parse_args()
+
+    runtime_seq_length = min(args.seq_length, 15) if args.debug_fast_response else args.seq_length
+    movement_buffer_size = 3 if args.debug_fast_response else 8
+    action_buffer_size = 3 if args.debug_fast_response else 8
+    movement_hysteresis_frames = 1 if args.debug_fast_response else 2
+    stationary_hysteresis_frames = 3 if args.debug_fast_response else 4
+    moving_classes = {'approaching', 'moving_away', 'moving_left', 'moving_right'}
+    motion_continuity_energy_threshold = 0.004
+    motion_continuity_depth_threshold = 0.003
+    motion_continuity_scale_threshold = 0.01
+    motion_continuity_conf_threshold = 0.25
+    direction_prior_threshold = 0.035
+    direction_prior_boost = 0.18
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -162,23 +176,29 @@ def main():
         print(f"Screenshots will be saved to: {screenshot_dir}")
 
     # Buffers
-    skeleton_buffer = deque(maxlen=args.seq_length)
+    skeleton_buffer = deque(maxlen=runtime_seq_length)
     gesture_buffer = deque(maxlen=10)
-    movement_buffer = deque(maxlen=20)
-    action_buffer = deque(maxlen=20)
+    movement_buffer = deque(maxlen=movement_buffer_size)
+    action_buffer = deque(maxlen=action_buffer_size)
     fps_buffer = deque(maxlen=30)
     movement_display_name = None
     movement_display_conf = 0.0
     movement_candidate_name = None
     movement_candidate_conf = 0.0
     movement_candidate_streak = 0
-    movement_hysteresis_frames = 2
 
     print("\n" + "=" * 55)
     print("HUMAN-AWARE ROBOT NAVIGATION — COMBINED LIVE TEST")
     print("Gesture: Landmark-based (Random Forest)")
     print("Movement: LSTM (skeleton sequences)")
     print("Action: ST-GCN (skeleton graphs)")
+    if args.debug_fast_response:
+        print(
+            f"Mode: debug fast response "
+            f"(seq={runtime_seq_length}, move_buf={movement_buffer_size}, "
+            f"action_buf={action_buffer_size}, hysteresis={movement_hysteresis_frames}, "
+            f"stationary_hysteresis={stationary_hysteresis_frames})"
+        )
     print("Press S to save a screenshot")
     print("Press Q to quit")
     print("=" * 55 + "\n")
@@ -224,6 +244,7 @@ def main():
         move_conf = 0.0
         move_probs = None
         move_current_text = ""
+        depth_scale = None
         action_name = None
         action_conf = 0.0
         action_probs = None
@@ -294,7 +315,18 @@ def main():
             skeleton = np.array(landmarks, dtype=np.float32)
             skeleton_buffer.append(skeleton)
 
-            if len(skeleton_buffer) == args.seq_length:
+            if len(skeleton_buffer) < runtime_seq_length:
+                if movement_model is not None:
+                    movement_text = (
+                        f"Movement displayed: buffering "
+                        f"({len(skeleton_buffer)}/{runtime_seq_length})"
+                    )
+                if action_model is not None:
+                    action_text = (
+                        f"Action: buffering ({len(skeleton_buffer)}/{runtime_seq_length})"
+                    )
+
+            if len(skeleton_buffer) == runtime_seq_length:
                 skeleton_seq = np.array(list(skeleton_buffer))
 
                 # Movement LSTM
@@ -312,6 +344,16 @@ def main():
 
                     if len(movement_buffer) >= 3:
                         avg_probs = np.mean(list(movement_buffer), axis=0)
+                        approach_bias = (
+                            depth_scale['approaching_score'] - depth_scale['moving_away_score']
+                        )
+                        if movement_classes is not None:
+                            for idx, class_name in movement_classes.items():
+                                if class_name == 'approaching' and approach_bias >= direction_prior_threshold:
+                                    avg_probs[idx] += direction_prior_boost
+                                elif class_name == 'moving_away' and approach_bias <= -direction_prior_threshold:
+                                    avg_probs[idx] += direction_prior_boost
+                        avg_probs = avg_probs / max(float(np.sum(avg_probs)), 1e-6)
                         move_probs = avg_probs
                         pred_idx, move_conf, stationary_gated = apply_stationary_motion_gate(
                             avg_probs,
@@ -320,8 +362,49 @@ def main():
                             depth_change=depth_scale['depth_change'],
                             scale_change=depth_scale['scale_change'],
                         )
+                        continuity_motion = (
+                            motion_energy >= motion_continuity_energy_threshold or
+                            depth_scale['depth_change'] >= motion_continuity_depth_threshold or
+                            depth_scale['scale_change'] >= motion_continuity_scale_threshold
+                        )
+                        if (
+                            stationary_gated and
+                            movement_display_name in moving_classes and
+                            continuity_motion
+                        ):
+                            non_stationary_scores = [
+                                (idx, score)
+                                for idx, score in enumerate(avg_probs)
+                                if movement_classes[idx] != 'stationary'
+                            ]
+                            if non_stationary_scores:
+                                alt_idx, alt_conf = max(
+                                    non_stationary_scores, key=lambda item: item[1]
+                                )
+                                if alt_conf >= motion_continuity_conf_threshold:
+                                    pred_idx = alt_idx
+                                    move_conf = float(alt_conf)
+                                    stationary_gated = False
+                        if (
+                            movement_classes[pred_idx] == 'stationary' and
+                            abs(approach_bias) >= direction_prior_threshold
+                        ):
+                            preferred_name = 'approaching' if approach_bias > 0 else 'moving_away'
+                            preferred_idx = next(
+                                (
+                                    idx for idx, class_name in movement_classes.items()
+                                    if class_name == preferred_name
+                                ),
+                                None
+                            )
+                            if preferred_idx is not None and avg_probs[preferred_idx] >= motion_continuity_conf_threshold:
+                                pred_idx = preferred_idx
+                                move_conf = float(avg_probs[preferred_idx])
+                                stationary_gated = False
                         move_name = movement_classes[pred_idx]
                         move_current_text = f"Movement current: {move_name} ({move_conf:.0%})"
+                        if abs(approach_bias) >= direction_prior_threshold:
+                            move_current_text += " [dir:approach]" if approach_bias > 0 else " [dir:away]"
                         if move_conf > args.confidence:
                             if movement_display_name is None:
                                 movement_display_name = move_name
@@ -343,7 +426,14 @@ def main():
                                     movement_candidate_conf = move_conf
                                     movement_candidate_streak = 1
 
-                                if movement_candidate_streak >= movement_hysteresis_frames:
+                                transition_frames = (
+                                    stationary_hysteresis_frames
+                                    if move_name == 'stationary' and
+                                    movement_display_name is not None and
+                                    movement_display_name != 'stationary'
+                                    else movement_hysteresis_frames
+                                )
+                                if movement_candidate_streak >= transition_frames:
                                     movement_display_name = movement_candidate_name
                                     movement_display_conf = movement_candidate_conf
                                     movement_candidate_name = None
@@ -387,6 +477,13 @@ def main():
                             action_text = f"Action: uncertain ({action_conf:.0%})"
         else:
             movement_text = "Movement displayed: No person detected"
+            action_text = "Action: No person detected" if action_model is not None else ""
+            move_current_text = ""
+            skeleton_buffer.clear()
+            movement_buffer.clear()
+            action_buffer.clear()
+            movement_display_name = None
+            movement_display_conf = 0.0
             movement_candidate_name = None
             movement_candidate_conf = 0.0
             movement_candidate_streak = 0
@@ -416,40 +513,63 @@ def main():
             fused_conf = 0.0
             fused_source = ""
             if move_probs is not None and action_probs is not None:
-                approaching_action_conf = max(
-                    (
-                        action_probs[idx]
-                        for idx, name in action_classes.items()
-                        if name == 'approaching'
-                    ),
-                    default=0.0
+                move_scores = {
+                    name: max(
+                        (
+                            move_probs[idx]
+                            for idx, class_name in movement_classes.items()
+                            if class_name == name
+                        ),
+                        default=0.0
+                    )
+                    for name in set(movement_classes.values())
+                }
+                action_scores = {
+                    name: max(
+                        (
+                            action_probs[idx]
+                            for idx, class_name in action_classes.items()
+                            if class_name == name
+                        ),
+                        default=0.0
+                    )
+                    for name in set(action_classes.values())
+                }
+                approaching_action_conf = action_scores.get('approaching', 0.0)
+                approaching_move_conf = move_scores.get('approaching', 0.0)
+                moving_away_move_conf = move_scores.get('moving_away', 0.0)
+                direction_bias = (
+                    depth_scale['approaching_score'] - depth_scale['moving_away_score']
+                    if depth_scale is not None
+                    else 0.0
                 )
-                if approaching_action_conf > 0.8:
+                if direction_bias >= direction_prior_threshold:
+                    approaching_move_conf += direction_prior_boost
+                elif direction_bias <= -direction_prior_threshold:
+                    moving_away_move_conf += direction_prior_boost
+
+                if (
+                    approaching_action_conf > 0.8 and
+                    moving_away_move_conf < 0.45 and
+                    approaching_move_conf >= 0.2
+                ):
                     fused_name = 'approaching'
                     fused_conf = approaching_action_conf
                     fused_source = 'stgcn-override'
                 else:
                     fused_scores = {}
-                    all_names = set(movement_classes.values()) | set(action_classes.values())
+                    all_names = set(move_scores) | set(action_scores)
                     for name in all_names:
-                        move_score = max(
-                            (
-                                move_probs[idx]
-                                for idx, class_name in movement_classes.items()
-                                if class_name == name
-                            ),
-                            default=0.0
-                        )
-                        action_score = max(
-                            (
-                                action_probs[idx]
-                                for idx, class_name in action_classes.items()
-                                if class_name == name
-                            ),
-                            default=0.0
-                        )
+                        move_score = move_scores.get(name, 0.0)
+                        action_score = action_scores.get(name, 0.0)
                         if name == 'approaching':
                             fused_scores[name] = 0.3 * move_score + 0.7 * action_score
+                            if direction_bias >= direction_prior_threshold:
+                                fused_scores[name] += direction_prior_boost
+                        elif name == 'moving_away':
+                            fused_scores[name] = 0.7 * move_score + 0.3 * action_score
+                            if direction_bias <= -direction_prior_threshold:
+                                fused_scores[name] += direction_prior_boost
                         else:
                             fused_scores[name] = 0.7 * move_score + 0.3 * action_score
 
@@ -532,13 +652,16 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
         # Buffers
-        cv2.putText(frame, f"Skel: {len(skeleton_buffer)}/{args.seq_length}",
+        cv2.putText(frame, f"Skel: {len(skeleton_buffer)}/{runtime_seq_length}",
                     (w - 120, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         cv2.putText(frame, f"Gest: {len(gesture_buffer)}/10",
                     (w - 120, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         if screenshot_dir is not None:
             cv2.putText(frame, f"Shots: {screenshot_count}", (w - 120, 85),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        if args.debug_fast_response:
+            cv2.putText(frame, "FAST DBG", (w - 120, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 255, 120), 1)
 
         if (
             screenshot_dir is not None and

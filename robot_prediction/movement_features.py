@@ -84,15 +84,24 @@ def estimate_depth_scale_signature(skeleton_seq):
     smoothed = smooth_skeleton_sequence(skeleton_seq)
     approach_features = compute_approach_away_features(smoothed)
     depth_change = float(np.mean(np.abs(approach_features[1:, 6]))) if approach_features.shape[0] > 1 else 0.0
+    signed_depth_delta = float(approach_features[-1, 0] - approach_features[0, 0]) if approach_features.shape[0] > 1 else 0.0
 
     shoulder_width = approach_features[:, 2]
     baseline_width = max(float(np.mean(shoulder_width[:3])), 1e-6)
+    signed_scale_delta = float((shoulder_width[-1] - shoulder_width[0]) / baseline_width)
     scale_change = float(
         np.max(np.abs((shoulder_width - baseline_width) / baseline_width))
     )
+    # MediaPipe z tends to become more negative as the subject approaches the camera.
+    approaching_score = max(0.0, -signed_depth_delta) + max(0.0, signed_scale_delta)
+    moving_away_score = max(0.0, signed_depth_delta) + max(0.0, -signed_scale_delta)
     return {
         'depth_change': depth_change,
         'scale_change': scale_change,
+        'signed_depth_delta': signed_depth_delta,
+        'signed_scale_delta': signed_scale_delta,
+        'approaching_score': approaching_score,
+        'moving_away_score': moving_away_score,
     }
 
 
