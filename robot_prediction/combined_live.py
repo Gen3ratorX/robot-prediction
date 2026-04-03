@@ -63,6 +63,7 @@ def main():
     motion_continuity_scale_threshold = 0.01
     motion_continuity_conf_threshold = 0.25
     direction_prior_threshold = 0.035
+    direction_force_threshold = 0.05
     direction_prior_boost = 0.18
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -355,6 +356,7 @@ def main():
                                     avg_probs[idx] += direction_prior_boost
                         avg_probs = avg_probs / max(float(np.sum(avg_probs)), 1e-6)
                         move_probs = avg_probs
+                        direction_forced = False
                         pred_idx, move_conf, stationary_gated = apply_stationary_motion_gate(
                             avg_probs,
                             movement_classes,
@@ -385,10 +387,7 @@ def main():
                                     pred_idx = alt_idx
                                     move_conf = float(alt_conf)
                                     stationary_gated = False
-                        if (
-                            movement_classes[pred_idx] == 'stationary' and
-                            abs(approach_bias) >= direction_prior_threshold
-                        ):
+                        if abs(approach_bias) >= direction_force_threshold:
                             preferred_name = 'approaching' if approach_bias > 0 else 'moving_away'
                             preferred_idx = next(
                                 (
@@ -397,15 +396,18 @@ def main():
                                 ),
                                 None
                             )
-                            if preferred_idx is not None and avg_probs[preferred_idx] >= motion_continuity_conf_threshold:
+                            if preferred_idx is not None:
                                 pred_idx = preferred_idx
-                                move_conf = float(avg_probs[preferred_idx])
+                                move_conf = max(float(avg_probs[preferred_idx]), 0.7)
                                 stationary_gated = False
+                                direction_forced = True
                         move_name = movement_classes[pred_idx]
                         move_current_text = f"Movement current: {move_name} ({move_conf:.0%})"
                         if abs(approach_bias) >= direction_prior_threshold:
                             move_current_text += " [dir:approach]" if approach_bias > 0 else " [dir:away]"
-                        if move_conf > args.confidence:
+                        if direction_forced:
+                            move_current_text += " [dir-force]"
+                        if move_conf > args.confidence or direction_forced:
                             if movement_display_name is None:
                                 movement_display_name = move_name
                                 movement_display_conf = move_conf
@@ -427,6 +429,12 @@ def main():
                                     movement_candidate_streak = 1
 
                                 transition_frames = (
+                                    1
+                                    if {
+                                        move_name,
+                                        movement_display_name,
+                                    } == {'approaching', 'moving_away'}
+                                    else
                                     stationary_hysteresis_frames
                                     if move_name == 'stationary' and
                                     movement_display_name is not None and
@@ -548,7 +556,15 @@ def main():
                 elif direction_bias <= -direction_prior_threshold:
                     moving_away_move_conf += direction_prior_boost
 
-                if (
+                if direction_bias >= direction_force_threshold:
+                    fused_name = 'approaching'
+                    fused_conf = max(approaching_move_conf, 0.7)
+                    fused_source = 'direction'
+                elif direction_bias <= -direction_force_threshold:
+                    fused_name = 'moving_away'
+                    fused_conf = max(moving_away_move_conf, 0.7)
+                    fused_source = 'direction'
+                elif (
                     approaching_action_conf > 0.8 and
                     moving_away_move_conf < 0.45 and
                     approaching_move_conf >= 0.2
