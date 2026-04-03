@@ -63,6 +63,7 @@ class HumanAwareNavigationNode(Node):
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('use_camera_topic', True)
         self.declare_parameter('camera_device', 0)
+        self.declare_parameter('demo_mode', True)
 
         self.model_dir = self.get_parameter('model_dir').value
         self.seq_length = self.get_parameter('seq_length').value
@@ -72,6 +73,19 @@ class HumanAwareNavigationNode(Node):
         camera_topic = self.get_parameter('camera_topic').value
         self.use_camera_topic = self.get_parameter('use_camera_topic').value
         self.camera_device = self.get_parameter('camera_device').value
+        self.demo_mode = self.get_parameter('demo_mode').value
+
+        self.runtime_seq_length = min(self.seq_length, 20) if self.demo_mode else self.seq_length
+        self.movement_buffer_size = 5 if self.demo_mode else 8
+        self.action_buffer_size = 5 if self.demo_mode else 8
+        self.moving_classes = {'approaching', 'moving_away', 'moving_left', 'moving_right'}
+        self.motion_continuity_energy_threshold = 0.004
+        self.motion_continuity_depth_threshold = 0.003
+        self.motion_continuity_scale_threshold = 0.01
+        self.motion_continuity_conf_threshold = 0.25
+        self.direction_prior_threshold = 0.035
+        self.direction_force_threshold = 0.05
+        self.direction_prior_boost = 0.18
 
         self.device = torch.device('cpu')
         self.get_logger().info(f"Device: {self.device}")
@@ -100,10 +114,10 @@ class HumanAwareNavigationNode(Node):
         )
 
         # Buffers
-        self.skeleton_buffer = deque(maxlen=self.seq_length)
+        self.skeleton_buffer = deque(maxlen=self.runtime_seq_length)
         self.gesture_buffer = deque(maxlen=10)
-        self.movement_buffer = deque(maxlen=15)
-        self.action_buffer = deque(maxlen=15)
+        self.movement_buffer = deque(maxlen=self.movement_buffer_size)
+        self.action_buffer = deque(maxlen=self.action_buffer_size)
 
         # CV Bridge
         self.bridge = CvBridge()
@@ -211,8 +225,11 @@ class HumanAwareNavigationNode(Node):
         gesture_conf = 0.0
         movement_name = ""
         movement_conf = 0.0
+        move_probs = None
+        depth_scale = None
         action_name = ""
         action_conf = 0.0
+        action_probs = None
         hand_found = False
 
         # ---- GESTURE RECOGNITION ----
@@ -250,7 +267,7 @@ class HumanAwareNavigationNode(Node):
             skeleton = np.array(landmarks, dtype=np.float32)
             self.skeleton_buffer.append(skeleton)
 
-            if len(self.skeleton_buffer) == self.seq_length:
+            if len(self.skeleton_buffer) == self.runtime_seq_length:
                 skeleton_seq = np.array(list(self.skeleton_buffer))
 
                 # Movement LSTM
@@ -268,6 +285,16 @@ class HumanAwareNavigationNode(Node):
 
                     if len(self.movement_buffer) >= 3:
                         avg_probs = np.mean(list(self.movement_buffer), axis=0)
+                        approach_bias = (
+                            depth_scale['approaching_score'] - depth_scale['moving_away_score']
+                        )
+                        for idx, class_name in self.movement_classes.items():
+                            if class_name == 'approaching' and approach_bias >= self.direction_prior_threshold:
+                                avg_probs[idx] += self.direction_prior_boost
+                            elif class_name == 'moving_away' and approach_bias <= -self.direction_prior_threshold:
+                                avg_probs[idx] += self.direction_prior_boost
+                        avg_probs = avg_probs / max(float(np.sum(avg_probs)), 1e-6)
+                        move_probs = avg_probs
                         pred_idx, movement_conf, _ = apply_stationary_motion_gate(
                             avg_probs,
                             self.movement_classes,
@@ -275,6 +302,39 @@ class HumanAwareNavigationNode(Node):
                             depth_change=depth_scale['depth_change'],
                             scale_change=depth_scale['scale_change'],
                         )
+                        continuity_motion = (
+                            motion_energy >= self.motion_continuity_energy_threshold or
+                            depth_scale['depth_change'] >= self.motion_continuity_depth_threshold or
+                            depth_scale['scale_change'] >= self.motion_continuity_scale_threshold
+                        )
+                        if (
+                            self.movement_classes[pred_idx] == 'stationary' and
+                            continuity_motion
+                        ):
+                            non_stationary_scores = [
+                                (idx, score)
+                                for idx, score in enumerate(avg_probs)
+                                if self.movement_classes[idx] != 'stationary'
+                            ]
+                            if non_stationary_scores:
+                                alt_idx, alt_conf = max(
+                                    non_stationary_scores, key=lambda item: item[1]
+                                )
+                                if alt_conf >= self.motion_continuity_conf_threshold:
+                                    pred_idx = alt_idx
+                                    movement_conf = float(alt_conf)
+                        if abs(approach_bias) >= self.direction_force_threshold:
+                            preferred_name = 'approaching' if approach_bias > 0 else 'moving_away'
+                            preferred_idx = next(
+                                (
+                                    idx for idx, class_name in self.movement_classes.items()
+                                    if class_name == preferred_name
+                                ),
+                                None
+                            )
+                            if preferred_idx is not None:
+                                pred_idx = preferred_idx
+                                movement_conf = min(max(float(avg_probs[preferred_idx]), 0.7), 1.0)
                         movement_name = self.movement_classes[pred_idx]
 
                 # ST-GCN
@@ -290,9 +350,14 @@ class HumanAwareNavigationNode(Node):
 
                     if len(self.action_buffer) >= 3:
                         avg_probs = np.mean(list(self.action_buffer), axis=0)
+                        action_probs = avg_probs
                         pred_idx = np.argmax(avg_probs)
                         action_conf = avg_probs[pred_idx]
                         action_name = self.action_classes[pred_idx]
+        else:
+            self.skeleton_buffer.clear()
+            self.movement_buffer.clear()
+            self.action_buffer.clear()
 
         # ---- DECISION & PUBLISH ----
         cmd = Twist()
@@ -324,25 +389,95 @@ class HumanAwareNavigationNode(Node):
                 self.get_logger().info(f"GESTURE: TURN RIGHT ({gesture_conf:.0%})")
 
         # Priority 2: Movement avoidance
-        elif movement_name and movement_conf > self.confidence_threshold:
-            if movement_name == 'approaching':
+        else:
+            fused_name = None
+            fused_conf = 0.0
+            if move_probs is not None and action_probs is not None:
+                move_scores = {
+                    name: max(
+                        (
+                            move_probs[idx]
+                            for idx, class_name in self.movement_classes.items()
+                            if class_name == name
+                        ),
+                        default=0.0
+                    )
+                    for name in set(self.movement_classes.values())
+                }
+                action_scores = {
+                    name: max(
+                        (
+                            action_probs[idx]
+                            for idx, class_name in self.action_classes.items()
+                            if class_name == name
+                        ),
+                        default=0.0
+                    )
+                    for name in set(self.action_classes.values())
+                }
+                direction_bias = (
+                    depth_scale['approaching_score'] - depth_scale['moving_away_score']
+                    if depth_scale is not None
+                    else 0.0
+                )
+                approaching_move_conf = move_scores.get('approaching', 0.0)
+                moving_away_move_conf = move_scores.get('moving_away', 0.0)
+                approaching_action_conf = action_scores.get('approaching', 0.0)
+
+                if direction_bias >= self.direction_force_threshold:
+                    fused_name = 'approaching'
+                    fused_conf = min(max(approaching_move_conf, 0.7), 1.0)
+                elif direction_bias <= -self.direction_force_threshold:
+                    fused_name = 'moving_away'
+                    fused_conf = min(max(moving_away_move_conf, 0.7), 1.0)
+                elif (
+                    approaching_action_conf > 0.8 and
+                    moving_away_move_conf < 0.45 and
+                    approaching_move_conf >= 0.2
+                ):
+                    fused_name = 'approaching'
+                    fused_conf = approaching_action_conf
+                else:
+                    fused_scores = {}
+                    all_names = set(move_scores) | set(action_scores)
+                    for name in all_names:
+                        move_score = move_scores.get(name, 0.0)
+                        action_score = action_scores.get(name, 0.0)
+                        if name == 'approaching':
+                            fused_scores[name] = 0.3 * move_score + 0.7 * action_score
+                            if direction_bias >= self.direction_prior_threshold:
+                                fused_scores[name] += self.direction_prior_boost
+                        elif name == 'moving_away':
+                            fused_scores[name] = 0.7 * move_score + 0.3 * action_score
+                            if direction_bias <= -self.direction_prior_threshold:
+                                fused_scores[name] += self.direction_prior_boost
+                        else:
+                            fused_scores[name] = 0.7 * move_score + 0.3 * action_score
+                    fused_name, fused_conf = max(fused_scores.items(), key=lambda item: item[1])
+                    fused_conf = min(float(fused_conf), 1.0)
+            elif movement_name and movement_conf > self.confidence_threshold:
+                fused_name = movement_name
+                fused_conf = movement_conf
+            elif action_name and action_conf > self.confidence_threshold:
+                fused_name = action_name
+                fused_conf = action_conf
+
+            if fused_name == 'approaching' and fused_conf > self.confidence_threshold:
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.5
-                self.get_logger().warn(f"AVOIDANCE: Approaching ({movement_conf:.0%})")
-            elif movement_name == 'moving_left':
+                self.get_logger().warn(f"AVOIDANCE: Approaching ({fused_conf:.0%})")
+            elif fused_name == 'moving_left' and fused_conf > self.confidence_threshold:
                 cmd.linear.x = self.robot_speed * 0.5
                 cmd.angular.z = -0.3
-            elif movement_name == 'moving_right':
+            elif fused_name == 'moving_right' and fused_conf > self.confidence_threshold:
                 cmd.linear.x = self.robot_speed * 0.5
                 cmd.angular.z = 0.3
-            elif movement_name in ('moving_away', 'stationary'):
+            elif fused_name in ('moving_away', 'stationary'):
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
-
-        # Priority 3: Default
-        else:
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
+            else:
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
 
     
 

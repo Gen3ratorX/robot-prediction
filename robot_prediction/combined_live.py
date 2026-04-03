@@ -47,16 +47,21 @@ def main():
     parser.add_argument('--confidence', type=float, default=0.6)
     parser.add_argument('--seq_length', type=int, default=30)
     parser.add_argument('--debug_fast_response', action='store_true')
+    parser.add_argument('--demo_mode', action='store_true')
     parser.add_argument('--screenshot_dir', type=str, default='motion_screenshots')
     parser.add_argument('--screenshot_interval', type=float, default=0.0)
     parser.add_argument('--max_screenshots', type=int, default=0)
     args = parser.parse_args()
 
-    runtime_seq_length = min(args.seq_length, 15) if args.debug_fast_response else args.seq_length
-    movement_buffer_size = 3 if args.debug_fast_response else 8
-    action_buffer_size = 3 if args.debug_fast_response else 8
-    movement_hysteresis_frames = 1 if args.debug_fast_response else 2
-    stationary_hysteresis_frames = 3 if args.debug_fast_response else 4
+    runtime_seq_length = (
+        min(args.seq_length, 20) if args.demo_mode
+        else min(args.seq_length, 15) if args.debug_fast_response
+        else args.seq_length
+    )
+    movement_buffer_size = 5 if args.demo_mode else 3 if args.debug_fast_response else 8
+    action_buffer_size = 5 if args.demo_mode else 3 if args.debug_fast_response else 8
+    movement_hysteresis_frames = 2 if args.demo_mode else 1 if args.debug_fast_response else 2
+    stationary_hysteresis_frames = 4 if args.demo_mode else 3 if args.debug_fast_response else 4
     moving_classes = {'approaching', 'moving_away', 'moving_left', 'moving_right'}
     motion_continuity_energy_threshold = 0.004
     motion_continuity_depth_threshold = 0.003
@@ -193,7 +198,13 @@ def main():
     print("Gesture: Landmark-based (Random Forest)")
     print("Movement: LSTM (skeleton sequences)")
     print("Action: ST-GCN (skeleton graphs)")
-    if args.debug_fast_response:
+    if args.demo_mode:
+        print(
+            f"Mode: stable demo "
+            f"(seq={runtime_seq_length}, move_buf={movement_buffer_size}, "
+            f"action_buf={action_buffer_size})"
+        )
+    elif args.debug_fast_response:
         print(
             f"Mode: debug fast response "
             f"(seq={runtime_seq_length}, move_buf={movement_buffer_size}, "
@@ -402,11 +413,12 @@ def main():
                                 stationary_gated = False
                                 direction_forced = True
                         move_name = movement_classes[pred_idx]
-                        move_current_text = f"Movement current: {move_name} ({move_conf:.0%})"
-                        if abs(approach_bias) >= direction_prior_threshold:
-                            move_current_text += " [dir:approach]" if approach_bias > 0 else " [dir:away]"
-                        if direction_forced:
-                            move_current_text += " [dir-force]"
+                        if not args.demo_mode:
+                            move_current_text = f"Movement current: {move_name} ({move_conf:.0%})"
+                            if abs(approach_bias) >= direction_prior_threshold:
+                                move_current_text += " [dir:approach]" if approach_bias > 0 else " [dir:away]"
+                            if direction_forced:
+                                move_current_text += " [dir-force]"
                         if move_conf > args.confidence or direction_forced:
                             if movement_display_name is None:
                                 movement_display_name = move_name
@@ -448,17 +460,13 @@ def main():
                                     movement_candidate_conf = 0.0
                                     movement_candidate_streak = 0
 
-                            movement_text = (
-                                f"Movement displayed: {movement_display_name} "
-                                f"({movement_display_conf:.0%})"
-                            )
+                            movement_prefix = "Movement" if args.demo_mode else "Movement displayed"
+                            movement_text = f"{movement_prefix}: {movement_display_name} ({movement_display_conf:.0%})"
                         elif movement_display_name is not None:
-                            movement_text = (
-                                f"Movement displayed: {movement_display_name} "
-                                f"({movement_display_conf:.0%})"
-                            )
+                            movement_prefix = "Movement" if args.demo_mode else "Movement displayed"
+                            movement_text = f"{movement_prefix}: {movement_display_name} ({movement_display_conf:.0%})"
                         else:
-                            movement_text = "Movement displayed: uncertain"
+                            movement_text = "Movement: uncertain" if args.demo_mode else "Movement displayed: uncertain"
                         if stationary_gated and movement_display_name == 'stationary':
                             movement_text += " [stable]"
 
@@ -484,8 +492,8 @@ def main():
                         else:
                             action_text = f"Action: uncertain ({action_conf:.0%})"
         else:
-            movement_text = "Movement displayed: No person detected"
-            action_text = "Action: No person detected" if action_model is not None else ""
+            movement_text = "Movement: No person detected" if args.demo_mode else "Movement displayed: No person detected"
+            action_text = "Action: No person detected" if action_model is not None and not args.demo_mode else ""
             move_current_text = ""
             skeleton_buffer.clear()
             movement_buffer.clear()
@@ -558,11 +566,11 @@ def main():
 
                 if direction_bias >= direction_force_threshold:
                     fused_name = 'approaching'
-                    fused_conf = max(approaching_move_conf, 0.7)
+                    fused_conf = min(max(approaching_move_conf, 0.7), 1.0)
                     fused_source = 'direction'
                 elif direction_bias <= -direction_force_threshold:
                     fused_name = 'moving_away'
-                    fused_conf = max(moving_away_move_conf, 0.7)
+                    fused_conf = min(max(moving_away_move_conf, 0.7), 1.0)
                     fused_source = 'direction'
                 elif (
                     approaching_action_conf > 0.8 and
@@ -607,7 +615,10 @@ def main():
                     f"Motion Conf  LSTM:{move_conf:.0%}  ST-GCN:{action_conf:.0%}"
                 )
                 if fused_name is not None:
-                    confidence_text += f"  Fused:{fused_conf:.0%} ({fused_source})"
+                    if args.demo_mode:
+                        confidence_text += f"  Fused:{fused_conf:.0%}"
+                    else:
+                        confidence_text += f"  Fused:{fused_conf:.0%} ({fused_source})"
 
             if fused_name == "approaching" and fused_conf > args.confidence:
                 robot_cmd = "STOP + TURN (fused)"
@@ -628,8 +639,9 @@ def main():
 
         # Predictions
         y = 22
+        display_move_current_text = "" if args.demo_mode else move_current_text
         for text, color in [(gesture_text, (0, 255, 255)),
-                            (move_current_text, (255, 255, 255)),
+                            (display_move_current_text, (255, 255, 255)),
                             (movement_text, (255, 200, 0)),
                             (action_text, (200, 255, 0))]:
             if text:
@@ -675,7 +687,7 @@ def main():
         if screenshot_dir is not None:
             cv2.putText(frame, f"Shots: {screenshot_count}", (w - 120, 85),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        if args.debug_fast_response:
+        if args.debug_fast_response and not args.demo_mode:
             cv2.putText(frame, "FAST DBG", (w - 120, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 255, 120), 1)
 
