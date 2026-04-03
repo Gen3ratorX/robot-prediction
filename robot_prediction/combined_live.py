@@ -46,6 +46,9 @@ def main():
     parser.add_argument('--camera', type=int, default=0)
     parser.add_argument('--confidence', type=float, default=0.6)
     parser.add_argument('--seq_length', type=int, default=30)
+    parser.add_argument('--screenshot_dir', type=str, default='motion_screenshots')
+    parser.add_argument('--screenshot_interval', type=float, default=0.0)
+    parser.add_argument('--max_screenshots', type=int, default=0)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -150,6 +153,14 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    screenshot_dir = None
+    screenshot_count = 0
+    last_screenshot_time = time.time()
+    if args.screenshot_interval > 0 or args.max_screenshots > 0:
+        screenshot_dir = args.screenshot_dir
+        os.makedirs(screenshot_dir, exist_ok=True)
+        print(f"Screenshots will be saved to: {screenshot_dir}")
+
     # Buffers
     skeleton_buffer = deque(maxlen=args.seq_length)
     gesture_buffer = deque(maxlen=10)
@@ -161,15 +172,34 @@ def main():
     movement_candidate_name = None
     movement_candidate_conf = 0.0
     movement_candidate_streak = 0
-    movement_hysteresis_frames = 3
+    movement_hysteresis_frames = 2
 
     print("\n" + "=" * 55)
     print("HUMAN-AWARE ROBOT NAVIGATION — COMBINED LIVE TEST")
     print("Gesture: Landmark-based (Random Forest)")
     print("Movement: LSTM (skeleton sequences)")
     print("Action: ST-GCN (skeleton graphs)")
+    print("Press S to save a screenshot")
     print("Press Q to quit")
     print("=" * 55 + "\n")
+
+    def save_screenshot(image, reason):
+        nonlocal screenshot_count, last_screenshot_time
+        if screenshot_dir is None:
+            return False
+        if args.max_screenshots > 0 and screenshot_count >= args.max_screenshots:
+            return False
+
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        filename = (
+            f"{timestamp}_{reason}_{screenshot_count:03d}.png"
+        )
+        path = os.path.join(screenshot_dir, filename)
+        cv2.imwrite(path, image)
+        screenshot_count += 1
+        last_screenshot_time = time.time()
+        print(f"Saved screenshot: {path}")
+        return True
 
     while True:
         start_time = time.time()
@@ -193,6 +223,7 @@ def main():
         move_name = None
         move_conf = 0.0
         move_probs = None
+        move_current_text = ""
         action_name = None
         action_conf = 0.0
         action_probs = None
@@ -290,6 +321,7 @@ def main():
                             scale_change=depth_scale['scale_change'],
                         )
                         move_name = movement_classes[pred_idx]
+                        move_current_text = f"Movement current: {move_name} ({move_conf:.0%})"
                         if move_conf > args.confidence:
                             if movement_display_name is None:
                                 movement_display_name = move_name
@@ -319,16 +351,16 @@ def main():
                                     movement_candidate_streak = 0
 
                             movement_text = (
-                                f"Movement: {movement_display_name} "
+                                f"Movement displayed: {movement_display_name} "
                                 f"({movement_display_conf:.0%})"
                             )
                         elif movement_display_name is not None:
                             movement_text = (
-                                f"Movement: {movement_display_name} "
+                                f"Movement displayed: {movement_display_name} "
                                 f"({movement_display_conf:.0%})"
                             )
                         else:
-                            movement_text = f"Movement: uncertain ({move_conf:.0%})"
+                            movement_text = "Movement displayed: uncertain"
                         if stationary_gated and movement_display_name == 'stationary':
                             movement_text += " [stable]"
 
@@ -354,7 +386,7 @@ def main():
                         else:
                             action_text = f"Action: uncertain ({action_conf:.0%})"
         else:
-            movement_text = "Movement: No person detected"
+            movement_text = "Movement displayed: No person detected"
             movement_candidate_name = None
             movement_candidate_conf = 0.0
             movement_candidate_streak = 0
@@ -382,30 +414,64 @@ def main():
         else:
             fused_name = None
             fused_conf = 0.0
+            fused_source = ""
             if move_probs is not None and action_probs is not None:
-                movement_weight = max(move_conf, 1e-6)
-                action_weight = max(action_conf, 1e-6)
-                fused_scores = {}
-                for idx, name in movement_classes.items():
-                    fused_scores[name] = fused_scores.get(name, 0.0) + movement_weight * move_probs[idx]
-                for idx, name in action_classes.items():
-                    fused_scores[name] = fused_scores.get(name, 0.0) + action_weight * action_probs[idx]
+                approaching_action_conf = max(
+                    (
+                        action_probs[idx]
+                        for idx, name in action_classes.items()
+                        if name == 'approaching'
+                    ),
+                    default=0.0
+                )
+                if approaching_action_conf > 0.8:
+                    fused_name = 'approaching'
+                    fused_conf = approaching_action_conf
+                    fused_source = 'stgcn-override'
+                else:
+                    fused_scores = {}
+                    all_names = set(movement_classes.values()) | set(action_classes.values())
+                    for name in all_names:
+                        move_score = max(
+                            (
+                                move_probs[idx]
+                                for idx, class_name in movement_classes.items()
+                                if class_name == name
+                            ),
+                            default=0.0
+                        )
+                        action_score = max(
+                            (
+                                action_probs[idx]
+                                for idx, class_name in action_classes.items()
+                                if class_name == name
+                            ),
+                            default=0.0
+                        )
+                        if name == 'approaching':
+                            fused_scores[name] = 0.3 * move_score + 0.7 * action_score
+                        else:
+                            fused_scores[name] = 0.7 * move_score + 0.3 * action_score
 
-                fused_name, fused_score = max(fused_scores.items(), key=lambda item: item[1])
-                fused_conf = fused_score / (movement_weight + action_weight)
+                    fused_name, fused_conf = max(
+                        fused_scores.items(), key=lambda item: item[1]
+                    )
+                    fused_source = 'weighted'
             elif move_name and move_conf > args.confidence:
                 fused_name = move_name
                 fused_conf = move_conf
+                fused_source = 'lstm'
             elif action_name and action_conf > args.confidence:
                 fused_name = action_name
                 fused_conf = action_conf
+                fused_source = 'stgcn'
 
             if move_conf > 0.0 or action_conf > 0.0:
                 confidence_text = (
                     f"Motion Conf  LSTM:{move_conf:.0%}  ST-GCN:{action_conf:.0%}"
                 )
                 if fused_name is not None:
-                    confidence_text += f"  Fused:{fused_conf:.0%}"
+                    confidence_text += f"  Fused:{fused_conf:.0%} ({fused_source})"
 
             if fused_name == "approaching" and fused_conf > args.confidence:
                 robot_cmd = "STOP + TURN (fused)"
@@ -420,13 +486,14 @@ def main():
         # DRAW UI
         # ============================================
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 132), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, 0), (w, 154), (0, 0, 0), -1)
         cv2.rectangle(overlay, (0, h - 55), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
         # Predictions
         y = 22
         for text, color in [(gesture_text, (0, 255, 255)),
+                            (move_current_text, (255, 255, 255)),
                             (movement_text, (255, 200, 0)),
                             (action_text, (200, 255, 0))]:
             if text:
@@ -469,9 +536,23 @@ def main():
                     (w - 120, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         cv2.putText(frame, f"Gest: {len(gesture_buffer)}/10",
                     (w - 120, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        if screenshot_dir is not None:
+            cv2.putText(frame, f"Shots: {screenshot_count}", (w - 120, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        if (
+            screenshot_dir is not None and
+            args.screenshot_interval > 0 and
+            (args.max_screenshots == 0 or screenshot_count < args.max_screenshots) and
+            (time.time() - last_screenshot_time) >= args.screenshot_interval
+        ):
+            save_screenshot(frame, 'auto')
 
         cv2.imshow('Human-Aware Robot Navigation', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('s'):
+            save_screenshot(frame, 'manual')
+        elif key == ord('q'):
             break
 
     cap.release()

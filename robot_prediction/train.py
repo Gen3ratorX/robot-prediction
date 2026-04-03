@@ -96,9 +96,10 @@ class Trainer:
 
         return mixed_inputs
     
-    def train(self, train_loader, val_loader, epochs=50, lr=1e-3, 
+    def train(self, train_loader, val_loader, epochs=50, lr=1e-3,
               weight_decay=1e-4, patience=10, model_name='model',
-              label_smoothing=0.1, same_class_mixup=False, mixup_alpha=0.2):
+              label_smoothing=0.1, same_class_mixup=False, mixup_alpha=0.2,
+              class_weights=None):
         """
         Full training loop with:
         - Learning rate scheduling
@@ -106,7 +107,10 @@ class Trainer:
         - Best model checkpointing
         - Training history plots
         """
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=label_smoothing
+        )
         optimizer = optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
         )
@@ -365,6 +369,10 @@ def train_movement_lstm(data_dir, epochs=80, batch_size=32, lr=1e-3,
     train_loader, val_loader, test_loader = create_data_loaders(
         dataset, batch_size=batch_size
     )
+    class_weights = torch.ones(num_classes, dtype=torch.float32)
+    approaching_idx = dataset.class_to_idx.get('approaching')
+    if approaching_idx is not None:
+        class_weights[approaching_idx] = 2.0
     
     # Create model
     model = MovementLSTM(
@@ -381,6 +389,7 @@ def train_movement_lstm(data_dir, epochs=80, batch_size=32, lr=1e-3,
         epochs=epochs, lr=lr,
         model_name='movement_lstm',
         same_class_mixup=True,
+        class_weights=class_weights,
     )
     
     # Test
