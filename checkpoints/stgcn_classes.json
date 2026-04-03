@@ -1,1 +1,7 @@
-{"approaching": 0, "moving_away": 1, "moving_left": 2, "moving_right": 3, "stationary": 4}
+{
+  "approaching": 0,
+  "moving_away": 1,
+  "moving_left": 2,
+  "moving_right": 3,
+  "stationary": 4
+}
