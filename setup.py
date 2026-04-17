@@ -11,9 +11,10 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', [f'resource/{package_name}']),
         (f'share/{package_name}', ['package.xml']),
-        (f'share/{package_name}/launch', ['launch/view_robot.launch.py']),
+        (f'share/{package_name}/launch', ['launch/view_robot.launch.py', 'launch/plain_field.launch.py']),
         (f'share/{package_name}/urdf', ['urdf/robot_prediction_demo.urdf']),
         (f'share/{package_name}/rviz', ['rviz/robot_prediction_demo.rviz']),
+        (f'share/{package_name}/worlds', ['worlds/plain_field.world']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
