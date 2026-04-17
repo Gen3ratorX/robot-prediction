@@ -18,11 +18,10 @@ def generate_launch_description():
 
     gazebo = ExecuteProcess(
         cmd=[
-            'ros2',
-            'launch',
-            'turtlebot3_gazebo',
-            'turtlebot3_world.launch.py',
-            ['world:=', LaunchConfiguration('world')],
+            'gz',
+            'sim',
+            '-r',
+            LaunchConfiguration('world'),
         ],
         output='screen',
     )
