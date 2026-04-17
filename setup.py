@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'combined_ros2_node = robot_prediction.combined_ros2_node:main',
             'ros_inference_node = robot_prediction.ros_inference_node:main',
+            'ros2_experiment_logger = robot_prediction.ros2_experiment_logger:main',
+            'plot_experiment_results = robot_prediction.plot_experiment_results:main',
         ],
     },
 )
