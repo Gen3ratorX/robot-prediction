@@ -214,7 +214,6 @@ class HumanAwareNavigationNode(Node):
             return
         ret, frame = self.cap.read()
         if ret:
-            frame = cv2.flip(frame, 1)
             self.process_frame(frame)
 
     def image_callback(self, msg):
@@ -248,18 +247,6 @@ class HumanAwareNavigationNode(Node):
             if hand_results.multi_hand_landmarks:
                 hand_found = True
                 hand_landmarks = hand_results.multi_hand_landmarks[0]
-                if self.show_preview:
-                    mp.solutions.drawing_utils.draw_landmarks(
-                        display_frame,
-                        hand_landmarks,
-                        self.mp_hands.HAND_CONNECTIONS,
-                        mp.solutions.drawing_utils.DrawingSpec(
-                            color=(255, 0, 0), thickness=2, circle_radius=3
-                        ),
-                        mp.solutions.drawing_utils.DrawingSpec(
-                            color=(255, 255, 0), thickness=2
-                        ),
-                    )
 
                 raw = []
                 for lm in hand_landmarks.landmark:
@@ -282,18 +269,6 @@ class HumanAwareNavigationNode(Node):
         pose_results = self.pose.process(frame_rgb)
 
         if pose_results.pose_landmarks:
-            if self.show_preview:
-                mp.solutions.drawing_utils.draw_landmarks(
-                    display_frame,
-                    pose_results.pose_landmarks,
-                    self.mp_pose.POSE_CONNECTIONS,
-                    mp.solutions.drawing_utils.DrawingSpec(
-                        color=(0, 200, 0), thickness=1, circle_radius=1
-                    ),
-                    mp.solutions.drawing_utils.DrawingSpec(
-                        color=(200, 200, 200), thickness=1
-                    ),
-                )
             landmarks = []
             for lm in pose_results.pose_landmarks.landmark:
                 landmarks.append([lm.x, lm.y, lm.z])
