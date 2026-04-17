@@ -64,6 +64,7 @@ class HumanAwareNavigationNode(Node):
         self.declare_parameter('use_camera_topic', True)
         self.declare_parameter('camera_device', 0)
         self.declare_parameter('demo_mode', True)
+        self.declare_parameter('show_preview', False)
 
         self.model_dir = self.get_parameter('model_dir').value
         self.seq_length = self.get_parameter('seq_length').value
@@ -74,6 +75,7 @@ class HumanAwareNavigationNode(Node):
         self.use_camera_topic = self.get_parameter('use_camera_topic').value
         self.camera_device = self.get_parameter('camera_device').value
         self.demo_mode = self.get_parameter('demo_mode').value
+        self.show_preview = self.get_parameter('show_preview').value
 
         self.runtime_seq_length = min(self.seq_length, 20) if self.demo_mode else self.seq_length
         self.movement_buffer_size = 5 if self.demo_mode else 8
@@ -127,6 +129,9 @@ class HumanAwareNavigationNode(Node):
         self.gesture_pub = self.create_publisher(String, '/human_gesture', 10)
         self.movement_pub = self.create_publisher(String, '/human_movement', 10)
         self.action_pub = self.create_publisher(String, '/human_action', 10)
+
+        if self.show_preview:
+            cv2.namedWindow('ROS2 Human-Aware Navigation', cv2.WINDOW_NORMAL)
 
         # Subscribe to camera topic or use direct webcam
         if self.use_camera_topic:
@@ -209,6 +214,7 @@ class HumanAwareNavigationNode(Node):
             return
         ret, frame = self.cap.read()
         if ret:
+            frame = cv2.flip(frame, 1)
             self.process_frame(frame)
 
     def image_callback(self, msg):
@@ -219,6 +225,7 @@ class HumanAwareNavigationNode(Node):
             self.get_logger().error(f"CV Bridge error: {e}")
 
     def process_frame(self, frame):
+        display_frame = frame.copy()
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         gesture_name = ""
@@ -239,6 +246,18 @@ class HumanAwareNavigationNode(Node):
             if hand_results.multi_hand_landmarks:
                 hand_found = True
                 hand_landmarks = hand_results.multi_hand_landmarks[0]
+                if self.show_preview:
+                    mp.solutions.drawing_utils.draw_landmarks(
+                        display_frame,
+                        hand_landmarks,
+                        self.mp_hands.HAND_CONNECTIONS,
+                        mp.solutions.drawing_utils.DrawingSpec(
+                            color=(255, 0, 0), thickness=2, circle_radius=3
+                        ),
+                        mp.solutions.drawing_utils.DrawingSpec(
+                            color=(255, 255, 0), thickness=2
+                        ),
+                    )
 
                 raw = []
                 for lm in hand_landmarks.landmark:
@@ -261,6 +280,18 @@ class HumanAwareNavigationNode(Node):
         pose_results = self.pose.process(frame_rgb)
 
         if pose_results.pose_landmarks:
+            if self.show_preview:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    display_frame,
+                    pose_results.pose_landmarks,
+                    self.mp_pose.POSE_CONNECTIONS,
+                    mp.solutions.drawing_utils.DrawingSpec(
+                        color=(0, 200, 0), thickness=1, circle_radius=1
+                    ),
+                    mp.solutions.drawing_utils.DrawingSpec(
+                        color=(200, 200, 200), thickness=1
+                    ),
+                )
             landmarks = []
             for lm in pose_results.pose_landmarks.landmark:
                 landmarks.append([lm.x, lm.y, lm.z])
@@ -504,6 +535,89 @@ class HumanAwareNavigationNode(Node):
             msg.data = f"{action_name}:{action_conf:.2f}"
             self.action_pub.publish(msg)
 
+        if self.show_preview:
+            self._draw_preview(
+                display_frame,
+                gesture_name,
+                gesture_conf,
+                movement_name,
+                movement_conf,
+                action_name,
+                action_conf,
+                fused_name if 'fused_name' in locals() else "",
+                fused_conf if 'fused_conf' in locals() else 0.0,
+                cmd,
+            )
+
+    def _draw_preview(
+        self,
+        frame,
+        gesture_name,
+        gesture_conf,
+        movement_name,
+        movement_conf,
+        action_name,
+        action_conf,
+        fused_name,
+        fused_conf,
+        cmd,
+    ):
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 132), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, h - 44), (w, h), (0, 0, 0), -1)
+        frame[:] = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+        y = 24
+        entries = [
+            (
+                f"Gesture: {gesture_name} ({gesture_conf:.0%})"
+                if gesture_name and gesture_conf > self.confidence_threshold
+                else "Gesture: -",
+                (0, 255, 255),
+            ),
+            (
+                f"Movement: {movement_name} ({movement_conf:.0%})"
+                if movement_name
+                else "Movement: -",
+                (255, 200, 0),
+            ),
+            (
+                f"Action: {action_name} ({action_conf:.0%})"
+                if action_name
+                else "Action: -",
+                (200, 255, 0),
+            ),
+        ]
+        if fused_name:
+            entries.append((f"Decision: {fused_name} ({fused_conf:.0%})", (255, 255, 255)))
+
+        for text, color in entries:
+            cv2.putText(
+                frame,
+                text,
+                (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+            y += 22
+
+        robot_text = f"cmd vx={cmd.linear.x:.2f} wz={cmd.angular.z:.2f}"
+        cv2.putText(
+            frame,
+            robot_text,
+            (10, h - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.imshow('ROS2 Human-Aware Navigation', frame)
+        cv2.waitKey(1)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -515,6 +629,8 @@ def main(args=None):
     finally:
         if node.cap is not None:
             node.cap.release()
+        if getattr(node, 'show_preview', False):
+            cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
