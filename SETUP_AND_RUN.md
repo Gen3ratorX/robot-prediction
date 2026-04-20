@@ -1,40 +1,41 @@
-# Setup And Run Guide
+# Commands README
 
-This document explains how to open, build, run, and log experiments for the `robot_prediction` project on another VM.
+This file is the command reference for the `robot_prediction` project.
 
-## 1. Prerequisites
+It is organized in two parts:
 
-The target VM should have:
+1. Fresh install
+2. All run commands
+
+---
+
+# 1. Fresh Install
+
+## 1.1 Prerequisites
+
+The target machine should have:
 
 - Ubuntu with GUI access
 - ROS2 Jazzy
 - Python 3.12
 - `colcon`
 - a webcam
-- internet access for Python package installation
+- internet access
 
-Minimum Python packages needed:
-
-- `torch`
-- `mediapipe`
-- `numpy`
-- `scikit-learn`
-- `matplotlib`
-- `opencv-python`
-- `pypdf`
-- `fpdf`
-
-## 2. Clone The Project
-
-Create the ROS workspace if needed:
+## 1.2 Create the ROS2 workspace
 
 ```bash
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
-git clone https://github.com/Gen3ratorX/robot-prediction.git
 ```
 
-## 3. Create And Activate The Python Environment
+## 1.3 Clone the project
+
+```bash
+git clone https://github.com/Gen3ratorX/robot-prediction.git robot_prediction
+```
+
+## 1.4 Create the Python environment
 
 ```bash
 python3 -m venv ~/robot_env
@@ -42,13 +43,15 @@ source ~/robot_env/bin/activate
 pip install --upgrade pip
 ```
 
-Install the required Python packages:
+## 1.5 Install Python dependencies
+
+Use the pinned NumPy version to avoid MediaPipe / OpenCV compatibility problems:
 
 ```bash
-pip install torch mediapipe numpy scikit-learn matplotlib opencv-python pypdf fpdf
+pip install "numpy==1.26.4" torch mediapipe scikit-learn matplotlib opencv-python pypdf fpdf
 ```
 
-## 4. Build The ROS2 Package
+## 1.6 Build the ROS2 package
 
 ```bash
 cd ~/ros2_ws
@@ -57,24 +60,49 @@ colcon build --packages-select robot_prediction --symlink-install
 source ~/ros2_ws/install/setup.bash
 ```
 
-## 5. GUI Environment Variables
+## 1.7 GUI variables
 
-If the VM uses a desktop session, export:
+For live preview windows:
 
 ```bash
 export DISPLAY=:0
 export QT_QPA_PLATFORM=xcb
 ```
 
-If the Python environment is used together with ROS:
+## 1.8 Python path for ROS2
+
+When running ROS nodes from the virtual environment:
 
 ```bash
 export PYTHONPATH=$HOME/robot_env/lib/python3.12/site-packages:$PYTHONPATH
 ```
 
-## 6. Main Desktop Commands
+## 1.9 Fresh install verification
 
-### Run the full desktop demo
+### Check the repo
+
+```bash
+cd ~/ros2_ws/src/robot_prediction
+git rev-parse HEAD
+git status --short
+```
+
+### Check the ROS build
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+ros2 pkg list | grep robot_prediction
+```
+
+---
+
+# 2. All Commands
+
+## 2.1 Desktop live commands
+
+### Full desktop demo
 
 ```bash
 source ~/robot_env/bin/activate
@@ -84,7 +112,7 @@ export QT_QPA_PLATFORM=xcb
 python3 robot_prediction/combined_live.py --model_dir checkpoints --demo_mode
 ```
 
-### Run fast debug mode
+### Fast debug mode
 
 ```bash
 source ~/robot_env/bin/activate
@@ -94,7 +122,7 @@ export QT_QPA_PLATFORM=xcb
 python3 robot_prediction/combined_live.py --model_dir checkpoints --debug_fast_response
 ```
 
-### Test gesture model only
+### Gesture model only
 
 ```bash
 source ~/robot_env/bin/activate
@@ -104,7 +132,7 @@ export QT_QPA_PLATFORM=xcb
 python3 robot_prediction/gesture_landmarks.py test
 ```
 
-### Test movement and action models only
+### Movement + action models only
 
 ```bash
 source ~/robot_env/bin/activate
@@ -114,9 +142,40 @@ export QT_QPA_PLATFORM=xcb
 python3 robot_prediction/test_live.py --model_dir checkpoints
 ```
 
-## 7. ROS2 Runtime Commands
+## 2.2 ROS2 runtime commands
 
-### Run the ROS2 node
+### Run ROS2 node without preview
+
+```bash
+source ~/robot_env/bin/activate
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+export PYTHONPATH=$HOME/robot_env/lib/python3.12/site-packages:$PYTHONPATH
+
+ros2 run robot_prediction combined_ros2_node --ros-args \
+  -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
+  -p use_camera_topic:=false \
+  -p camera_device:=0
+```
+
+### Run ROS2 node with preview window
+
+```bash
+source ~/robot_env/bin/activate
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+export PYTHONPATH=$HOME/robot_env/lib/python3.12/site-packages:$PYTHONPATH
+export DISPLAY=:0
+export QT_QPA_PLATFORM=xcb
+
+ros2 run robot_prediction combined_ros2_node --ros-args \
+  -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
+  -p use_camera_topic:=false \
+  -p camera_device:=0 \
+  -p show_preview:=true
+```
+
+### Lower movement confidence threshold for testing
 
 ```bash
 source ~/robot_env/bin/activate
@@ -128,33 +187,56 @@ ros2 run robot_prediction combined_ros2_node --ros-args \
   -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
   -p use_camera_topic:=false \
   -p camera_device:=0 \
-  -p demo_mode:=true
+  -p confidence_threshold:=0.4
 ```
 
-### Inspect nodes and topics
+## 2.3 ROS2 inspection commands
+
+### List nodes
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 ros2 node list
-ros2 topic list
 ```
 
-### Monitor outputs
+### List topics
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
+ros2 topic list
+```
 
+### Check topic type
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+ros2 topic type /human_movement
+```
+
+### Echo prediction topics
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
 ros2 topic echo /human_gesture std_msgs/msg/String
 ros2 topic echo /human_movement std_msgs/msg/String
 ros2 topic echo /human_action std_msgs/msg/String
+```
+
+### Echo robot commands
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
 ros2 topic echo /cmd_vel geometry_msgs/msg/TwistStamped
 ```
 
-## 8. Gazebo Commands
+## 2.4 Gazebo commands
 
-### Launch TurtleBot3 Gazebo world
+### Launch TurtleBot3 Gazebo
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -162,7 +244,7 @@ export TURTLEBOT3_MODEL=burger
 ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
 ```
 
-### Run the ROS2 node in another terminal
+### Run the ROS2 node while Gazebo is running
 
 ```bash
 source ~/robot_env/bin/activate
@@ -173,23 +255,14 @@ export PYTHONPATH=$HOME/robot_env/lib/python3.12/site-packages:$PYTHONPATH
 ros2 run robot_prediction combined_ros2_node --ros-args \
   -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
   -p use_camera_topic:=false \
-  -p camera_device:=0 \
-  -p demo_mode:=true
+  -p camera_device:=0
 ```
 
-## 9. Logging And Results Workflow
-
-The project includes:
-
-- `robot_prediction/ros2_experiment_logger.py`
-- `robot_prediction/plot_experiment_results.py`
-- `scripts/run_ros2_experiment.sh`
+## 2.5 Logging and results commands
 
 ### One-command experiment logging
 
-Keep the ROS2 node running in one terminal.
-
-In another terminal:
+Keep the ROS2 node running in one terminal. In another terminal:
 
 ```bash
 cd ~/ros2_ws/src/robot_prediction
@@ -198,88 +271,92 @@ cd ~/ros2_ws/src/robot_prediction
   --notes "Direct frontal approach, normal lighting"
 ```
 
-This creates:
-
-- `results/approaching_run_01/events.csv`
-- `results/approaching_run_01/summary.csv`
-- `results/approaching_run_01/summary_table.csv`
-- `results/approaching_run_01/metrics.json`
-- plots as `.png`
-
-### More examples
-
-Gesture experiment:
+### Gesture run example
 
 ```bash
+cd ~/ros2_ws/src/robot_prediction
 ./scripts/run_ros2_experiment.sh gesture_stop_01 15 \
   --expected-gesture stop \
   --notes "Right hand stop gesture"
 ```
 
-Movement experiment:
+### Movement-away run example
 
 ```bash
+cd ~/ros2_ws/src/robot_prediction
 ./scripts/run_ros2_experiment.sh away_run_01 20 \
   --expected-movement moving_away \
   --notes "Subject walking away from camera"
 ```
 
-## 10. Recommended Experiment Plan
-
-For thesis-quality results, run at least:
-
-- 3 trials for each gesture:
-  - `stop`
-  - `forward`
-  - `backward`
-  - `left`
-  - `right`
-- 3 trials for each movement:
-  - `approaching`
-  - `moving_away`
-  - `moving_left`
-  - `moving_right`
-  - `stationary`
-
-Record notes for each run:
-
-- lighting condition
-- camera distance
-- subject position
-- whether the run was clean or had interruptions
-
-## 11. Suggested First-Time Workflow On A Friend’s VM
-
-1. Clone the project into `~/ros2_ws/src`
-2. Create `~/robot_env`
-3. Install the required Python packages
-4. Build the ROS2 package with `colcon`
-5. Run the desktop demo first
-6. Run the ROS2 node
-7. Run one logged experiment
-8. Inspect the generated plots and tables
-
-## 12. Notes
-
-- The checkpoints must remain in `~/ros2_ws/src/robot_prediction/checkpoints`
-- The ROS2 package must be rebuilt after pulling new code:
+### Re-plot an existing run
 
 ```bash
+cd ~/ros2_ws/src/robot_prediction
+python3 -m robot_prediction.plot_experiment_results \
+  --run-dir results/approaching_run_01
+```
+
+## 2.6 Rebuild commands after pull
+
+```bash
+cd ~/ros2_ws/src/robot_prediction
+git pull origin main
+
 cd ~/ros2_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select robot_prediction --symlink-install
 source ~/ros2_ws/install/setup.bash
 ```
 
-- If GUI windows do not appear, ensure:
+## 2.7 Useful maintenance commands
+
+### Check current commit
+
+```bash
+cd ~/ros2_ws/src/robot_prediction
+git rev-parse HEAD
+```
+
+### Check repo cleanliness
+
+```bash
+cd ~/ros2_ws/src/robot_prediction
+git status --short
+```
+
+### Reinstall NumPy if MediaPipe/OpenCV starts misbehaving
+
+```bash
+source ~/robot_env/bin/activate
+pip install "numpy==1.26.4"
+```
+
+---
+
+# Notes
+
+- The checkpoints are expected at:
+
+```bash
+~/ros2_ws/src/robot_prediction/checkpoints
+```
+
+- If GUI windows do not appear:
 
 ```bash
 export DISPLAY=:0
 export QT_QPA_PLATFORM=xcb
 ```
 
-- If ROS cannot see Python packages from the virtual environment, re-export:
+- If ROS cannot see the Python packages from the virtual environment:
 
 ```bash
 export PYTHONPATH=$HOME/robot_env/lib/python3.12/site-packages:$PYTHONPATH
+```
+
+- If you see duplicate package errors in `colcon`, make sure only one copy of the project exists in:
+
+```bash
+~/ros2_ws/src
 ```
