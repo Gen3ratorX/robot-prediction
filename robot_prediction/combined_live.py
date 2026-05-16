@@ -58,10 +58,12 @@ def main():
         else min(args.seq_length, 15) if args.debug_fast_response
         else args.seq_length
     )
-    movement_buffer_size = 5 if args.demo_mode else 3 if args.debug_fast_response else 8
+    movement_buffer_size = 5 if args.demo_mode else 3 if args.debug_fast_response else 20
     action_buffer_size = 5 if args.demo_mode else 3 if args.debug_fast_response else 8
-    movement_hysteresis_frames = 2 if args.demo_mode else 1 if args.debug_fast_response else 2
+    movement_hysteresis_frames = 3 if args.demo_mode else 1 if args.debug_fast_response else 3
     stationary_hysteresis_frames = 4 if args.demo_mode else 3 if args.debug_fast_response else 4
+    movement_min_average_frames = min(5, movement_buffer_size)
+    movement_update_confidence_threshold = max(args.confidence, 0.8)
     moving_classes = {'approaching', 'moving_away', 'moving_left', 'moving_right'}
     motion_continuity_energy_threshold = 0.004
     motion_continuity_depth_threshold = 0.003
@@ -209,7 +211,8 @@ def main():
             f"Mode: debug fast response "
             f"(seq={runtime_seq_length}, move_buf={movement_buffer_size}, "
             f"action_buf={action_buffer_size}, hysteresis={movement_hysteresis_frames}, "
-            f"stationary_hysteresis={stationary_hysteresis_frames})"
+            f"stationary_hysteresis={stationary_hysteresis_frames}, "
+            f"move_update_conf={movement_update_confidence_threshold:.0%})"
         )
     print("Press S to save a screenshot")
     print("Press Q to quit")
@@ -354,7 +357,7 @@ def main():
 
                     movement_buffer.append(probs.cpu().numpy()[0])
 
-                    if len(movement_buffer) >= 3:
+                    if len(movement_buffer) >= movement_min_average_frames:
                         avg_probs = np.mean(list(movement_buffer), axis=0)
                         approach_bias = (
                             depth_scale['approaching_score'] - depth_scale['moving_away_score']
@@ -419,7 +422,7 @@ def main():
                                 move_current_text += " [dir:approach]" if approach_bias > 0 else " [dir:away]"
                             if direction_forced:
                                 move_current_text += " [dir-force]"
-                        if move_conf > args.confidence or direction_forced:
+                        if move_conf >= movement_update_confidence_threshold:
                             if movement_display_name is None:
                                 movement_display_name = move_name
                                 movement_display_conf = move_conf
@@ -441,12 +444,6 @@ def main():
                                     movement_candidate_streak = 1
 
                                 transition_frames = (
-                                    1
-                                    if {
-                                        move_name,
-                                        movement_display_name,
-                                    } == {'approaching', 'moving_away'}
-                                    else
                                     stationary_hysteresis_frames
                                     if move_name == 'stationary' and
                                     movement_display_name is not None and
@@ -463,9 +460,15 @@ def main():
                             movement_prefix = "Movement" if args.demo_mode else "Movement displayed"
                             movement_text = f"{movement_prefix}: {movement_display_name} ({movement_display_conf:.0%})"
                         elif movement_display_name is not None:
+                            movement_candidate_name = None
+                            movement_candidate_conf = 0.0
+                            movement_candidate_streak = 0
                             movement_prefix = "Movement" if args.demo_mode else "Movement displayed"
                             movement_text = f"{movement_prefix}: {movement_display_name} ({movement_display_conf:.0%})"
                         else:
+                            movement_candidate_name = None
+                            movement_candidate_conf = 0.0
+                            movement_candidate_streak = 0
                             movement_text = "Movement: uncertain" if args.demo_mode else "Movement displayed: uncertain"
                         if stationary_gated and movement_display_name == 'stationary':
                             movement_text += " [stable]"

@@ -78,8 +78,14 @@ class HumanAwareNavigationNode(Node):
         self.show_preview = self.get_parameter('show_preview').value
 
         self.runtime_seq_length = min(self.seq_length, 20) if self.demo_mode else self.seq_length
-        self.movement_buffer_size = 5 if self.demo_mode else 8
+        self.movement_buffer_size = 20
         self.action_buffer_size = 5 if self.demo_mode else 8
+        self.movement_hysteresis_frames = 3
+        self.stationary_hysteresis_frames = 4
+        self.movement_min_average_frames = min(5, self.movement_buffer_size)
+        self.movement_update_confidence_threshold = max(
+            self.confidence_threshold, 0.8
+        )
         self.moving_classes = {'approaching', 'moving_away', 'moving_left', 'moving_right'}
         self.motion_continuity_energy_threshold = 0.004
         self.motion_continuity_depth_threshold = 0.003
@@ -120,6 +126,11 @@ class HumanAwareNavigationNode(Node):
         self.gesture_buffer = deque(maxlen=10)
         self.movement_buffer = deque(maxlen=self.movement_buffer_size)
         self.action_buffer = deque(maxlen=self.action_buffer_size)
+        self.movement_display_name = None
+        self.movement_display_conf = 0.0
+        self.movement_candidate_name = None
+        self.movement_candidate_conf = 0.0
+        self.movement_candidate_streak = 0
 
         # CV Bridge
         self.bridge = CvBridge()
@@ -150,7 +161,56 @@ class HumanAwareNavigationNode(Node):
             self.timer = self.create_timer(0.033, self.timer_callback)
             self.get_logger().info(f"Using direct webcam: /dev/video{self.camera_device}")
 
-        self.get_logger().info("Human-Aware Navigation Node initialized!")
+        self.get_logger().info(
+            "Human-Aware Navigation Node initialized! "
+            f"movement_buffer={self.movement_buffer_size}, "
+            f"movement_update_conf={self.movement_update_confidence_threshold:.0%}, "
+            f"movement_hysteresis={self.movement_hysteresis_frames}"
+        )
+
+    def _reset_movement_hysteresis(self, clear_display=False):
+        self.movement_candidate_name = None
+        self.movement_candidate_conf = 0.0
+        self.movement_candidate_streak = 0
+        if clear_display:
+            self.movement_display_name = None
+            self.movement_display_conf = 0.0
+
+    def _update_movement_display(self, move_name, move_conf):
+        if move_conf < self.movement_update_confidence_threshold:
+            self._reset_movement_hysteresis()
+            return self.movement_display_name, self.movement_display_conf
+
+        if self.movement_display_name is None:
+            self.movement_display_name = move_name
+            self.movement_display_conf = move_conf
+            self._reset_movement_hysteresis()
+            return self.movement_display_name, self.movement_display_conf
+
+        if move_name == self.movement_display_name:
+            self.movement_display_conf = move_conf
+            self._reset_movement_hysteresis()
+            return self.movement_display_name, self.movement_display_conf
+
+        if move_name == self.movement_candidate_name:
+            self.movement_candidate_streak += 1
+            self.movement_candidate_conf = move_conf
+        else:
+            self.movement_candidate_name = move_name
+            self.movement_candidate_conf = move_conf
+            self.movement_candidate_streak = 1
+
+        transition_frames = (
+            self.stationary_hysteresis_frames
+            if move_name == 'stationary' and self.movement_display_name != 'stationary'
+            else self.movement_hysteresis_frames
+        )
+        if self.movement_candidate_streak >= transition_frames:
+            self.movement_display_name = self.movement_candidate_name
+            self.movement_display_conf = self.movement_candidate_conf
+            self._reset_movement_hysteresis()
+
+        return self.movement_display_name, self.movement_display_conf
 
     def _load_gesture_model(self):
         model_path = os.path.join(self.model_dir, 'gesture_landmark_model.pkl')
@@ -314,7 +374,7 @@ class HumanAwareNavigationNode(Node):
 
                     self.movement_buffer.append(probs.cpu().numpy()[0])
 
-                    if len(self.movement_buffer) >= 3:
+                    if len(self.movement_buffer) >= self.movement_min_average_frames:
                         avg_probs = np.mean(list(self.movement_buffer), axis=0)
                         approach_bias = (
                             depth_scale['approaching_score'] - depth_scale['moving_away_score']
@@ -326,7 +386,7 @@ class HumanAwareNavigationNode(Node):
                                 avg_probs[idx] += self.direction_prior_boost
                         avg_probs = avg_probs / max(float(np.sum(avg_probs)), 1e-6)
                         move_probs = avg_probs
-                        pred_idx, movement_conf, _ = apply_stationary_motion_gate(
+                        pred_idx, raw_movement_conf, _ = apply_stationary_motion_gate(
                             avg_probs,
                             self.movement_classes,
                             motion_energy,
@@ -353,7 +413,7 @@ class HumanAwareNavigationNode(Node):
                                 )
                                 if alt_conf >= self.motion_continuity_conf_threshold:
                                     pred_idx = alt_idx
-                                    movement_conf = float(alt_conf)
+                                    raw_movement_conf = float(alt_conf)
                         if abs(approach_bias) >= self.direction_force_threshold:
                             preferred_name = 'approaching' if approach_bias > 0 else 'moving_away'
                             preferred_idx = next(
@@ -365,8 +425,18 @@ class HumanAwareNavigationNode(Node):
                             )
                             if preferred_idx is not None:
                                 pred_idx = preferred_idx
-                                movement_conf = min(max(float(avg_probs[preferred_idx]), 0.7), 1.0)
-                        movement_name = self.movement_classes[pred_idx]
+                                raw_movement_conf = min(
+                                    max(float(avg_probs[preferred_idx]), 0.7),
+                                    1.0,
+                                )
+                        raw_movement_name = self.movement_classes[pred_idx]
+                        stable_name, stable_conf = self._update_movement_display(
+                            raw_movement_name,
+                            raw_movement_conf,
+                        )
+                        if stable_name is not None:
+                            movement_name = stable_name
+                            movement_conf = stable_conf
 
                 # ST-GCN
                 if self.action_model is not None:
@@ -389,6 +459,7 @@ class HumanAwareNavigationNode(Node):
             self.skeleton_buffer.clear()
             self.movement_buffer.clear()
             self.action_buffer.clear()
+            self._reset_movement_hysteresis(clear_display=True)
 
         # ---- DECISION & PUBLISH ----
         cmd = Twist()

@@ -118,6 +118,7 @@ class MovementDataset(Dataset):
         else:
             skeleton_seq = skeleton_seq[:self.seq_length]
         if self.normalize:
+            # Centers on MediaPipe hip midpoint (23/24) and appends key-joint velocities.
             skeleton_flat = build_movement_features(skeleton_seq)
         else:
             T, J, C = skeleton_seq.shape
