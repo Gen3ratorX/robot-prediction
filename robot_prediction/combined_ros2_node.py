@@ -3,11 +3,8 @@
 ROS2 Combined Inference Node — Human-Aware Robot Navigation
 ==============================================================
 
-Publishes both Twist and TwistStamped for compatibility with
-TurtleBot3 Gazebo simulation on ROS2 Jazzy.
-
 Publishes:
-    /cmd_vel            (geometry_msgs/Twist + TwistStamped)
+    /cmd_vel            (geometry_msgs/Twist)
     /human_gesture      (std_msgs/String)
     /human_movement     (std_msgs/String)
     /human_action       (std_msgs/String)
@@ -31,7 +28,7 @@ import mediapipe as mp
 from collections import deque
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
@@ -136,7 +133,7 @@ class HumanAwareNavigationNode(Node):
         self.bridge = CvBridge()
 
 
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.gesture_pub = self.create_publisher(String, '/human_gesture', 10)
         self.movement_pub = self.create_publisher(String, '/human_movement', 10)
         self.action_pub = self.create_publisher(String, '/human_action', 10)
@@ -583,12 +580,7 @@ class HumanAwareNavigationNode(Node):
 
     
 
-        # Publish TwistStamped for Gazebo TurtleBot3 compatibility
-        stamped = TwistStamped()
-        stamped.header.stamp = self.get_clock().now().to_msg()
-        stamped.header.frame_id = 'base_link'
-        stamped.twist = cmd
-        self.cmd_vel_pub.publish(stamped)
+        self.cmd_vel_pub.publish(cmd)
 
         # Publish predictions
         if gesture_name and gesture_conf > self.confidence_threshold:
@@ -691,19 +683,30 @@ class HumanAwareNavigationNode(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = HumanAwareNavigationNode()
+    rclpy_initialised = False
+    node = None
     try:
+        rclpy.init(args=args)
+        rclpy_initialised = True
+        node = HumanAwareNavigationNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Exception):
         pass
     finally:
-        if node.cap is not None:
-            node.cap.release()
-        if getattr(node, 'show_preview', False):
-            cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            try:
+                stop = Twist()
+                node.cmd_vel_pub.publish(stop)
+                rclpy.spin_once(node, timeout_sec=0.1)
+            except Exception:
+                pass
+            if node.cap is not None:
+                node.cap.release()
+            if getattr(node, 'show_preview', False):
+                cv2.destroyAllWindows()
+            node.destroy_node()
+        if rclpy_initialised:
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
