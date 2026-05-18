@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import cv2
 import json
 import os
-import pickle
+import joblib
 import mediapipe as mp
 from collections import deque
 
@@ -215,10 +215,8 @@ class HumanAwareNavigationNode(Node):
         classes_path = os.path.join(self.model_dir, 'gesture_landmark_classes.json')
 
         if os.path.exists(model_path):
-            with open(model_path, 'rb') as f:
-                self.gesture_model = pickle.load(f)
-            with open(scaler_path, 'rb') as f:
-                self.gesture_scaler = pickle.load(f)
+            self.gesture_model = joblib.load(model_path)
+            self.gesture_scaler = joblib.load(scaler_path)
             with open(classes_path, 'r') as f:
                 self.gesture_classes = json.load(f)
             self.get_logger().info(f"Gesture model loaded: {self.gesture_classes}")
