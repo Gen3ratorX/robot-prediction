@@ -9,17 +9,21 @@ Publishes:
     /human_movement     (std_msgs/String)
     /human_action       (std_msgs/String)
 
-Usage:
+Usage (Pi5 — no torch):
+    ROS_DOMAIN_ID=20 ros2 run robot_prediction combined_ros2_node --ros-args \
+        -p model_dir:=/path/to/checkpoints \
+        -p use_camera_topic:=false -p camera_device:=0
+
+Usage (dev machine — with torch, torch ST-GCN):
     ros2 run robot_prediction combined_ros2_node --ros-args \
         -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
-        -p use_camera_topic:=false -p camera_device:=0
+        -p use_camera_topic:=false -p camera_device:=0 \
+        -p use_onnx_for_stgcn:=false
 """
 
 import rclpy
 from rclpy.node import Node
 import numpy as np
-import torch
-import torch.nn.functional as F
 import cv2
 import json
 import os
@@ -35,7 +39,23 @@ from cv_bridge import CvBridge
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import MovementLSTM, SpatioTemporalGCN
+try:
+    import torch
+    import torch.nn.functional as F
+    from models import MovementLSTM, SpatioTemporalGCN
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    F = None
+    _TORCH_AVAILABLE = False
+
+try:
+    import onnxruntime as ort
+    _ORT_AVAILABLE = True
+except ImportError:
+    ort = None
+    _ORT_AVAILABLE = False
+
 from movement_features import (
     MOVEMENT_FEATURE_SIZE,
     apply_stationary_motion_gate,
@@ -44,6 +64,11 @@ from movement_features import (
     estimate_motion_energy,
 )
 from gesture_landmarks import extract_advanced_features
+
+
+def _softmax(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
 
 
 class HumanAwareNavigationNode(Node):
@@ -60,7 +85,7 @@ class HumanAwareNavigationNode(Node):
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('use_camera_topic', True)
         self.declare_parameter('camera_device', 0)
-        self.declare_parameter('demo_mode', True)
+        self.declare_parameter('use_onnx_for_stgcn', True)
         self.declare_parameter('show_preview', False)
 
         self.model_dir = self.get_parameter('model_dir').value
@@ -71,12 +96,12 @@ class HumanAwareNavigationNode(Node):
         camera_topic = self.get_parameter('camera_topic').value
         self.use_camera_topic = self.get_parameter('use_camera_topic').value
         self.camera_device = self.get_parameter('camera_device').value
-        self.demo_mode = self.get_parameter('demo_mode').value
+        self.use_onnx_for_stgcn = self.get_parameter('use_onnx_for_stgcn').value
         self.show_preview = self.get_parameter('show_preview').value
 
-        self.runtime_seq_length = min(self.seq_length, 20) if self.demo_mode else self.seq_length
+        self.runtime_seq_length = self.seq_length
         self.movement_buffer_size = 20
-        self.action_buffer_size = 5 if self.demo_mode else 8
+        self.action_buffer_size = 5
         self.movement_hysteresis_frames = 3
         self.stationary_hysteresis_frames = 4
         self.movement_min_average_frames = min(5, self.movement_buffer_size)
@@ -92,8 +117,12 @@ class HumanAwareNavigationNode(Node):
         self.direction_force_threshold = 0.05
         self.direction_prior_boost = 0.18
 
-        self.device = torch.device('cpu')
-        self.get_logger().info(f"Device: {self.device}")
+        if _TORCH_AVAILABLE:
+            self.device = torch.device('cpu')
+            self.get_logger().info("torch available — LSTM movement model enabled")
+        else:
+            self.device = None
+            self.get_logger().info("torch not found — LSTM movement model disabled")
 
         # Load all models
         self._load_gesture_model()
@@ -225,6 +254,11 @@ class HumanAwareNavigationNode(Node):
             self.get_logger().warn("Gesture model not found")
 
     def _load_movement_model(self):
+        self.movement_classes = {}
+        if not _TORCH_AVAILABLE:
+            self.movement_model = None
+            return
+
         movement_json = os.path.join(self.model_dir, 'movement_classes.json')
         movement_pth = os.path.join(self.model_dir, 'movement_lstm_best.pth')
 
@@ -246,23 +280,49 @@ class HumanAwareNavigationNode(Node):
 
     def _load_action_model(self):
         gcn_json = os.path.join(self.model_dir, 'stgcn_classes.json')
-        gcn_pth = os.path.join(self.model_dir, 'stgcn_best.pth')
-
-        if os.path.exists(gcn_json) and os.path.exists(gcn_pth):
-            with open(gcn_json) as f:
-                classes = json.load(f)
-            self.action_classes = {v: k for k, v in classes.items()}
-
-            self.action_model = SpatioTemporalGCN(
-                num_classes=len(classes), num_joints=self.num_joints
-            )
-            ckpt = torch.load(gcn_pth, map_location=self.device, weights_only=True)
-            self.action_model.load_state_dict(ckpt['model_state_dict'])
-            self.action_model.to(self.device).eval()
-            self.get_logger().info(f"ST-GCN loaded: {list(classes.keys())}")
-        else:
+        if not os.path.exists(gcn_json):
             self.action_model = None
-            self.get_logger().warn("ST-GCN model not found")
+            self.get_logger().warn("stgcn_classes.json not found — action model disabled")
+            return
+
+        with open(gcn_json) as f:
+            classes = json.load(f)
+        self.action_classes = {v: k for k, v in classes.items()}
+
+        if self.use_onnx_for_stgcn:
+            onnx_path = os.path.join(self.model_dir, 'stgcn.onnx')
+            if _ORT_AVAILABLE and os.path.exists(onnx_path):
+                self.action_model = ort.InferenceSession(
+                    onnx_path, providers=['CPUExecutionProvider']
+                )
+                self.get_logger().info(
+                    f"ST-GCN loaded via ONNX (T={self.seq_length}): {list(classes.keys())}"
+                )
+            else:
+                self.action_model = None
+                if not _ORT_AVAILABLE:
+                    self.get_logger().warn("onnxruntime not installed — ST-GCN disabled")
+                else:
+                    self.get_logger().warn(f"stgcn.onnx not found in {self.model_dir}")
+        else:
+            gcn_pth = os.path.join(self.model_dir, 'stgcn_best.pth')
+            if _TORCH_AVAILABLE and os.path.exists(gcn_pth):
+                self.action_model = SpatioTemporalGCN(
+                    num_classes=len(classes), num_joints=self.num_joints
+                )
+                ckpt = torch.load(gcn_pth, map_location=self.device, weights_only=True)
+                self.action_model.load_state_dict(ckpt['model_state_dict'])
+                self.action_model.to(self.device).eval()
+                self.get_logger().info(f"ST-GCN loaded via torch: {list(classes.keys())}")
+            else:
+                self.action_model = None
+                if not _TORCH_AVAILABLE:
+                    self.get_logger().warn(
+                        "torch not installed — ST-GCN disabled "
+                        "(use_onnx_for_stgcn:=false requires torch)"
+                    )
+                else:
+                    self.get_logger().warn(f"stgcn_best.pth not found in {self.model_dir}")
 
     def timer_callback(self):
         if self.cap is None:
@@ -435,14 +495,18 @@ class HumanAwareNavigationNode(Node):
 
                 # ST-GCN
                 if self.action_model is not None:
-                    seq_t = skeleton_seq.transpose(2, 0, 1)
-                    input_t = torch.tensor(seq_t).unsqueeze(0).to(self.device)
+                    seq_t = skeleton_seq.transpose(2, 0, 1)  # (3, T, 33)
+                    if self.use_onnx_for_stgcn:
+                        ort_in = seq_t[np.newaxis].astype(np.float32)  # (1, 3, T, 33)
+                        logits = self.action_model.run(None, {'input': ort_in})[0]
+                        probs = _softmax(logits[0])
+                    else:
+                        input_t = torch.tensor(seq_t).unsqueeze(0).to(self.device)
+                        with torch.no_grad():
+                            logits = self.action_model(input_t)
+                            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
 
-                    with torch.no_grad():
-                        logits = self.action_model(input_t)
-                        probs = F.softmax(logits, dim=1)
-
-                    self.action_buffer.append(probs.cpu().numpy()[0])
+                    self.action_buffer.append(probs)
 
                     if len(self.action_buffer) >= 3:
                         avg_probs = np.mean(list(self.action_buffer), axis=0)

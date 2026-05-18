@@ -2,10 +2,122 @@
 
 This file is the command reference for the `robot_prediction` project.
 
-It is organized in two parts:
+It is organized in three parts:
 
-1. Fresh install
-2. All run commands
+1. Yahboom MicroROS-Pi5 quick start (verified working)
+2. Fresh VM / desktop install
+3. All run commands
+
+---
+
+# 0. Yahboom MicroROS-Pi5 Quick Start
+
+This section covers running the node inside the Yahboom Docker container on a
+Pi5. All steps have been verified against the factory `yahboomtechnology/ros-humble:4.1.2`
+image (ROS2 Humble, Python 3.10).
+
+> **Safety note — put the robot on a stand before first run.**
+> The node publishes to `/cmd_vel` immediately once a confident prediction
+> fires. Keep the wheels off the ground until you have verified the topic
+> output looks correct with `ros2 topic echo`.
+
+## 0.1 Enter the Yahboom container
+
+```bash
+docker exec -it yahboom_ros bash
+```
+
+## 0.2 Set ROS_DOMAIN_ID
+
+The factory firmware runs `/YB_Car_Node` on domain 20. This must be set in
+every shell that runs the prediction node:
+
+```bash
+export ROS_DOMAIN_ID=20
+```
+
+Add this to `~/.bashrc` inside the container if you want it persistent.
+
+## 0.3 Install Python dependencies (Pi5 — no torch)
+
+numpy is pinned because mediapipe 0.10.x and cv2 4.8.x both have compiled
+extensions that expect the numpy 1.23 ABI. Do not upgrade numpy.
+
+```bash
+pip3 install "numpy==1.23.0" --force-reinstall
+pip3 install scikit-learn mediapipe
+pip3 install onnxruntime  # aarch64 wheel, ~10 MB
+```
+
+torch is **not required**. Without torch the LSTM movement branch is
+automatically disabled; gesture recognition and ST-GCN action (via
+onnxruntime) continue to work.
+
+If you later want torch for the LSTM movement branch, use a Pi5-compatible
+aarch64 wheel — the x86 pytorch.org CPU wheels will not install.
+
+## 0.4 Clone and build
+
+```bash
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone https://github.com/Gen3ratorX/robot-prediction.git robot_prediction
+
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select robot_prediction --symlink-install
+source ~/ros2_ws/install/setup.bash
+```
+
+## 0.5 Run the node
+
+```bash
+export ROS_DOMAIN_ID=20
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+
+ros2 run robot_prediction combined_ros2_node --ros-args \
+  -p model_dir:=$HOME/ros2_ws/src/robot_prediction/checkpoints \
+  -p use_camera_topic:=false \
+  -p camera_device:=0
+```
+
+`use_onnx_for_stgcn` defaults to `true` — no extra flag needed on the Pi.
+
+## 0.6 Verify topics
+
+In a second terminal (same container, same `ROS_DOMAIN_ID=20`):
+
+```bash
+export ROS_DOMAIN_ID=20
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+
+# Confirm the node is publishing
+ros2 topic list | grep -E 'cmd_vel|human'
+
+# Watch predictions
+ros2 topic echo /human_gesture
+ros2 topic echo /human_movement
+ros2 topic echo /human_action
+
+# Watch robot commands (should be zero Twist when nothing detected)
+ros2 topic echo /cmd_vel
+```
+
+Expected output format on prediction topics: `forward:0.94`, `approaching:0.81`, etc.
+
+## 0.7 Expected startup log
+
+```
+[INFO] torch not found — LSTM movement model disabled
+[INFO] Gesture model loaded: ['backward', 'forward', 'left', 'right', 'stop']
+[INFO] ST-GCN loaded via ONNX (T=30): ['approaching', 'moving_away', ...]
+[INFO] Using direct webcam: /dev/video0
+[INFO] Human-Aware Navigation Node initialized! ...
+```
+
+If ST-GCN shows disabled, verify `stgcn.onnx` is present in `checkpoints/`
+and onnxruntime is installed (`python3 -c "import onnxruntime"`).
 
 ---
 
