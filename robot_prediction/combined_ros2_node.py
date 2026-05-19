@@ -27,6 +27,8 @@ import numpy as np
 import cv2
 import json
 import os
+import time
+import threading
 import joblib
 import mediapipe as mp
 from collections import deque
@@ -55,6 +57,14 @@ try:
 except ImportError:
     ort = None
     _ORT_AVAILABLE = False
+
+try:
+    from flask import Flask, Response
+    _FLASK_AVAILABLE = True
+except ImportError:
+    Flask = None
+    Response = None
+    _FLASK_AVAILABLE = False
 
 from movement_features import (
     MOVEMENT_FEATURE_SIZE,
@@ -87,6 +97,7 @@ class HumanAwareNavigationNode(Node):
         self.declare_parameter('camera_device', 0)
         self.declare_parameter('use_onnx_for_stgcn', True)
         self.declare_parameter('show_preview', False)
+        self.declare_parameter('enable_web_preview', False)
 
         self.model_dir = self.get_parameter('model_dir').value
         self.seq_length = self.get_parameter('seq_length').value
@@ -98,6 +109,7 @@ class HumanAwareNavigationNode(Node):
         self.camera_device = self.get_parameter('camera_device').value
         self.use_onnx_for_stgcn = self.get_parameter('use_onnx_for_stgcn').value
         self.show_preview = self.get_parameter('show_preview').value
+        self.enable_web_preview = self.get_parameter('enable_web_preview').value
 
         self.runtime_seq_length = self.seq_length
         self.movement_buffer_size = 20
@@ -167,6 +179,9 @@ class HumanAwareNavigationNode(Node):
         self.movement_pub = self.create_publisher(String, '/human_movement', 10)
         self.action_pub = self.create_publisher(String, '/human_action', 10)
 
+        self._web_frame_bytes = None
+        self._web_frame_lock = threading.Lock()
+
         if self.show_preview:
             cv2.namedWindow('ROS2 Human-Aware Navigation', cv2.WINDOW_NORMAL)
 
@@ -193,6 +208,9 @@ class HumanAwareNavigationNode(Node):
             f"movement_update_conf={self.movement_update_confidence_threshold:.0%}, "
             f"movement_hysteresis={self.movement_hysteresis_frames}"
         )
+
+        if self.enable_web_preview:
+            self._start_mjpeg_server()
 
     def _reset_movement_hysteresis(self, clear_display=False):
         self.movement_candidate_name = None
@@ -323,6 +341,64 @@ class HumanAwareNavigationNode(Node):
                     )
                 else:
                     self.get_logger().warn(f"stgcn_best.pth not found in {self.model_dir}")
+
+    def _start_mjpeg_server(self):
+        if not _FLASK_AVAILABLE:
+            self.get_logger().warn(
+                "enable_web_preview=true but flask is not installed — "
+                "run: pip3 install flask  then restart the node"
+            )
+            self.enable_web_preview = False
+            return
+
+        import logging as _logging
+        _logging.getLogger('werkzeug').setLevel(_logging.ERROR)
+
+        app = Flask(__name__)
+        node_ref = self
+
+        def _generate():
+            while True:
+                with node_ref._web_frame_lock:
+                    jpg = node_ref._web_frame_bytes
+                if jpg is not None:
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n'
+                    )
+                time.sleep(0.1)
+
+        @app.route('/')
+        def _stream():
+            return Response(
+                _generate(),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+            )
+
+        t = threading.Thread(
+            target=lambda: app.run(
+                host='0.0.0.0', port=8080, debug=False, use_reloader=False
+            ),
+            daemon=True,
+        )
+        t.start()
+        self.get_logger().info("MJPEG web preview: http://0.0.0.0:8080/")
+
+    def _push_web_frame(self, frame, gesture_name, gesture_conf):
+        annotated = frame.copy()
+        label = (
+            f"Gesture: {gesture_name} ({gesture_conf:.0%})"
+            if gesture_name
+            else "Gesture: -"
+        )
+        cv2.putText(
+            annotated, label, (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+        )
+        ok, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ok:
+            with self._web_frame_lock:
+                self._web_frame_bytes = buf.tobytes()
 
     def timer_callback(self):
         if self.cap is None:
@@ -673,6 +749,9 @@ class HumanAwareNavigationNode(Node):
                 fused_conf if 'fused_conf' in locals() else 0.0,
                 cmd,
             )
+
+        if self.enable_web_preview:
+            self._push_web_frame(display_frame, gesture_name, gesture_conf)
 
     def _draw_preview(
         self,

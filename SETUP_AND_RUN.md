@@ -45,7 +45,7 @@ extensions that expect the numpy 1.23 ABI. Do not upgrade numpy.
 
 ```bash
 pip3 install "numpy==1.23.0" --force-reinstall
-pip3 install scikit-learn mediapipe
+pip3 install scikit-learn mediapipe flask
 pip3 install onnxruntime  # aarch64 wheel, ~10 MB
 ```
 
